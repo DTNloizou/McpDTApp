@@ -1,0 +1,9 @@
+@keyframes pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+@keyframes cogPulse {
+  0%, 100% { color: var(--dt-colors-text-primary-default, #2c2d4d); }
+  50% { color: #1496ff; }
+}

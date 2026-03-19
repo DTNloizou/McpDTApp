@@ -1,0 +1,21 @@
+{
+  "environmentUrl": "https://zef6234h.sprint.apps.dynatracelabs.com/",
+  "app": {
+    "name": "MCP DT App",
+    "version": "0.0.1",
+    "description": "Query remote MCP servers from within Dynatrace",
+    "id": "my.mcp.dt.app",
+    "scopes": [
+      { "name": "storage:logs:read", "comment": "Read logs from Grail" },
+      { "name": "storage:buckets:read", "comment": "Read Grail buckets" },
+      { "name": "storage:metrics:read", "comment": "Read metrics" },
+      { "name": "storage:entities:read", "comment": "Read entities" },
+      { "name": "storage:spans:read", "comment": "Read traces and spans" },
+      { "name": "app-settings:objects:read", "comment": "Read app settings" },
+      { "name": "app-settings:objects:write", "comment": "Write app settings" },
+      { "name": "state:app-states:read", "comment": "Read KB documents from state store" },
+      { "name": "state:app-states:write", "comment": "Write KB documents to state store" },
+      { "name": "state:app-states:delete", "comment": "Delete KB documents from state store" }
+    ]
+  }
+}
