@@ -99,8 +99,35 @@ export async function loadKBDocuments(): Promise<KBDocument[]> {
     documents = [];
   }
 
+  // Seed default KB documents on first run (if they don't already exist)
+  await seedDefaultDocuments();
+
   loaded = true;
   return [...documents];
+}
+
+// Default KB documents — auto-generated from .md files in ui/app/kb/
+import { DEFAULT_KB_DOCS } from './kb/defaults';
+
+/**
+ * Seed default KB documents if they don't already exist.
+ * Called once during loadKBDocuments on first run.
+ */
+async function seedDefaultDocuments(): Promise<void> {
+  for (const [name, content] of Object.entries(DEFAULT_KB_DOCS)) {
+    if (!documents.some((d) => d.name === name)) {
+      const doc: KBDocument = { name, content, addedAt: Date.now() };
+      documents.push(doc);
+      try {
+        await stateClient.setAppState({
+          key: KB_PREFIX + name,
+          body: { value: JSON.stringify(doc) },
+        });
+      } catch { /* best-effort */ }
+    }
+  }
+  // Update manifest if any defaults were seeded
+  await saveManifest();
 }
 
 export function getKBDocuments(): KBDocument[] {
