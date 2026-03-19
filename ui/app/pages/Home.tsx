@@ -489,6 +489,20 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     }
   };
 
+  // Fix common DQL syntax errors before execution
+  const fixDqlSyntax = (dql: string): string => {
+    let fixed = dql;
+    // Fix "summarize ... by field" → "summarize ..., by:{field}"
+    fixed = fixed.replace(/\|\s*summarize\s+(.+?)\s+by\s+(?!\{)(.+?)(?=\s*\||\s*$)/g, (_m, aggs, fields) => {
+      return `| summarize ${aggs.replace(/,\s*$/, '')}, by:{${fields.trim()}}`;
+    });
+    // Fix "round(x, 2)" → "round(x, decimals:2)"
+    fixed = fixed.replace(/round\(([^,]+),\s*(\d+)\)/g, 'round($1, decimals:$2)');
+    // Fix "sort count desc" → "sort `count()` desc" (unquoted aggregation names)
+    fixed = fixed.replace(/sort\s+count\s+(asc|desc)/gi, 'sort `count()` $1');
+    return fixed;
+  };
+
   const enrichRecommendationContent = async (text: string): Promise<string> => {
     const blocks: { fullMatch: string; dql: string; index: number }[] = [];
 
@@ -540,7 +554,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       const { fullMatch, dql, index } = deduped[i];
       let insertText = '';
       try {
-        const result = await executeDql(dql, 50);
+        const fixedDql = fixDqlSyntax(dql);
+        const result = await executeDql(fixedDql, 50);
         const raw = result.result?.content?.[0]?.text || '';
         if (result.status === 'success' && raw && raw.length > 5) {
           let tableOutput = '';
@@ -616,8 +631,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     setRecoLoading(true);
     setRecommendation(null);
     try {
-      const kbSummary = buildKBSummary(placeholderValues);
-      const result: ChatResponse = await getClaudeRecommendations(lastQuery.label, lastQuery.dql, lastQuery.results, kbSummary || undefined);
+      // Pass full KB documents to Claude (not just summaries) so it can learn DQL syntax, runbooks, etc.
+      const kbContext = buildKBContext(placeholderValues);
+      const result: ChatResponse = await getClaudeRecommendations(lastQuery.label, lastQuery.dql, lastQuery.results, kbContext || undefined);
       if (result.status === 'success') {
         setRecommendation({ role: 'assistant', content: result.response, toolCalls: result.toolCalls });
         setEnrichingReco(true);
