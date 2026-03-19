@@ -314,15 +314,18 @@ export async function getRecommendations(
     `DQL SYNTAX RULES (Dynatrace Query Language is NOT SQL):`,
     `- Group-by uses curly braces: summarize count(), by:{fieldName}  — NOT "summarize count() by fieldName"`,
     `- Multiple group-by fields: summarize count(), by:{field1, field2}`,
-    `- Time bucketing: summarize count(), by:{bin(timestamp, 1h)}`,
-    `- Mixed: summarize total = count(), errors = countIf(status == "ERROR"), by:{serviceName, bin(timestamp, 1h)}`,
+    `- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)}  — ALWAYS alias bin() so the field has a name`,
+    `- WRONG: by:{bin(timestamp, 1h)} — this drops the timestamp field name and breaks sort/references`,
+    `- Mixed: summarize total = count(), errors = countIf(status == "ERROR"), by:{serviceName, time = bin(timestamp, 1h)}`,
     `- Sorting: sort fieldName desc`,
     `- Math: round(value, decimals:2)  — NOT round(value, 2)`,
+    `- Multiplication must use explicit *: (a / b) * 100 — NOT (a / b) 100`,
+    `- contains() is a FUNCTION not an operator: contains(fieldName, "value") — NOT fieldName contains "value"`,
     `- toDouble() for arithmetic on string fields`,
     ``,
     `Example:`,
     '```dql',
-    'fetch bizevents, from:now()-7d | filter event.provider == "example" | summarize count(), by:{bin(timestamp, 1h)} | sort timestamp',
+    'fetch bizevents, from:now()-7d | filter contains(event.provider, "payment") | summarize count(), by:{time = bin(timestamp, 1h)} | sort time',
     '```',
     ``,
     `Be concise and practical. Use bullet points. If the results look healthy, say so.`,
@@ -341,6 +344,51 @@ export async function getRecommendations(
   }
 
   return proxyCall('/chat', 'POST', payload, overrides) as Promise<ChatResponse>;
+}
+
+/**
+ * Ask Claude to repair a broken DQL query using the parse error message.
+ * Returns the corrected query string, or null if repair isn't possible.
+ */
+export async function repairDqlWithClaude(brokenDql: string, errorMsg: string): Promise<string | null> {
+  const config = loadConfig();
+  if (!config.claudeEnabled || !config.claudeApiKey) return null;
+  try {
+    const res = await functions.call('anthropic-chat', {
+      data: {
+        anthropicApiKey: config.claudeApiKey,
+        messages: [{ role: 'user' as const, content: [
+          `This DQL query failed with a parse error. Fix it and return ONLY the corrected DQL query, nothing else — no explanation, no markdown, just the raw query.`,
+          ``,
+          `**Broken query:**`,
+          brokenDql,
+          ``,
+          `**Error:**`,
+          errorMsg.slice(0, 500),
+          ``,
+          `DQL RULES:`,
+            `- contains() is a FUNCTION: contains(fieldName, "value") — NOT fieldName contains "value"`,
+          `- Group-by: summarize count(), by:{fieldName}`,
+          `- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)} — ALWAYS alias bin()`,
+          `- Math: round(value, decimals:2) — NOT round(value, 2)`,
+          `- Multiplication needs explicit *: (a / b) * 100 — NOT (a / b) 100`,
+          `- sort by alias name when using bin(): sort time — NOT sort timestamp`,
+          `- Use toDouble() for string-to-number conversions`,
+        ].join('\n') }],
+        systemPrompt: 'You are a Dynatrace DQL syntax expert. Return ONLY the corrected DQL query, no explanation.',
+        maxTokens: 1024,
+      },
+    });
+    const result = await res.json() as { status: string; response?: string };
+    if (result.status === 'success' && result.response) {
+      let repaired = result.response.trim();
+      repaired = repaired.replace(/^```(?:dql|sql)?\s*\n?/m, '').replace(/\n?```\s*$/m, '').trim();
+      if (repaired.startsWith('fetch ') || repaired.startsWith('timeseries ')) {
+        return repaired;
+      }
+    }
+  } catch { /* repair is best-effort */ }
+  return null;
 }
 
 /**
@@ -425,9 +473,13 @@ export async function getClaudeRecommendations(
     `DQL SYNTAX RULES (Dynatrace Query Language is NOT SQL):`,
     `- Group-by uses curly braces: summarize count(), by:{fieldName}  — NOT "summarize count() by fieldName"`,
     `- Multiple group-by fields: summarize count(), by:{field1, field2}`,
-    `- Time bucketing: summarize count(), by:{bin(timestamp, 1h)}`,
-    `- Mixed: summarize total = count(), errors = countIf(status == "ERROR"), by:{serviceName}`,
+    `- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)}  — ALWAYS alias bin() so the field has a name`,
+    `- WRONG: by:{bin(timestamp, 1h)} — this drops the timestamp field name and breaks sort/references`,
+    `- Mixed: summarize total = count(), errors = countIf(status == "ERROR"), by:{serviceName, time = bin(timestamp, 1h)}`,
+    `- When using bin(), sort by the alias: sort time — NOT sort timestamp`,
     `- Math: round(value, decimals:2)  — NOT round(value, 2)`,
+    `- Multiplication must use explicit *: (a / b) * 100 — NOT (a / b) 100`,
+    `- contains() is a FUNCTION not an operator: contains(fieldName, "value") — NOT fieldName contains "value"`,
     `- toDouble() for arithmetic on string fields`,
     ``,
     `Be concise and practical. Use bullet points.`,

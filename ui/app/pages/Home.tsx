@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, forwardRef } from 'react';
 import { Flex } from '@dynatrace/strato-components/layouts';
 import { TitleBar } from '@dynatrace/strato-components-preview/layouts';
-import { sendChat, testConnection, testDavisConnection, executeDql, getRecommendations, getClaudeRecommendations, createNotebook, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
+import { sendChat, testConnection, testDavisConnection, executeDql, getRecommendations, getClaudeRecommendations, repairDqlWithClaude, createNotebook, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
 import { loadConfig } from '../config';
 import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
 import { loadCustomCategories, getCustomCategories, saveCustomCategories, type CustomCategory, type CustomQuery } from '../custom-queries';
@@ -500,6 +500,19 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     fixed = fixed.replace(/round\(([^,]+),\s*(\d+)\)/g, 'round($1, decimals:$2)');
     // Fix "sort count desc" → "sort `count()` desc" (unquoted aggregation names)
     fixed = fixed.replace(/sort\s+count\s+(asc|desc)/gi, 'sort `count()` $1');
+    // Fix bare "bin(timestamp, 1h)" inside by:{} → "time = bin(timestamp, 1h)" so the field is named
+    fixed = fixed.replace(/by:\{([^}]*)\b(?<!\w\s*=\s*)bin\(timestamp,/g, (_m, prefix) => {
+      return `by:{${prefix}time = bin(timestamp,`;
+    });
+    // Also fix "sort timestamp" → "sort time" when bin alias was applied
+    if (fixed.includes('time = bin(timestamp,')) {
+      fixed = fixed.replace(/\|\s*sort\s+timestamp\b/g, '| sort time');
+    }
+    // Fix infix "field contains "x"" → "contains(field, "x")" (contains is a function, not an operator)
+    fixed = fixed.replace(/(\w+(?:\.\w+)*)\s+contains\s+"([^"]+)"/g, 'contains($1, "$2")');
+    fixed = fixed.replace(/(\w+(?:\.\w+)*)\s+contains\s+'([^']+)'/g, "contains($1, '$2')");
+    // Fix missing * operator: ") 100" → ") * 100"
+    fixed = fixed.replace(/\)\s+(\d+(?:\.\d+)?)\s*(?=[,\n|)]|$)/g, ') * $1');
     return fixed;
   };
 
@@ -554,9 +567,38 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       const { fullMatch, dql, index } = deduped[i];
       let insertText = '';
       try {
-        const fixedDql = fixDqlSyntax(dql);
-        const result = await executeDql(fixedDql, 50);
-        const raw = result.result?.content?.[0]?.text || '';
+        // Step 1: Apply known syntax fixes
+        let currentDql = fixDqlSyntax(dql);
+        if (currentDql !== dql) {
+          const lesson = `### Auto-corrected DQL\n**Bad:** \`${dql}\`\n**Fixed:** \`${currentDql}\`\n`;
+          appendToKBDocument('dql-lessons.md', lesson).catch(() => {});
+        }
+
+        // Step 2: Execute, and if it fails with PARSE_ERROR, try to self-heal
+        let result = await executeDql(currentDql, 50);
+        let raw = result.result?.content?.[0]?.text || '';
+        const errMsg = result.message || '';
+        const isParseError = errMsg.includes('PARSE_ERROR') || errMsg.includes('DQL-ERROR');
+
+        if (isParseError) {
+          // Attempt Claude-based repair
+          const repaired = await repairDqlWithClaude(currentDql, errMsg);
+          if (repaired && repaired !== currentDql) {
+            // Log the repair to KB
+            const lesson = `### Claude-repaired DQL\n**Original:** \`${currentDql}\`\n**Error:** ${errMsg.slice(0, 300)}\n**Repaired:** \`${repaired}\`\n`;
+            appendToKBDocument('dql-lessons.md', lesson).catch(() => {});
+            // Retry with repaired query
+            currentDql = repaired;
+            result = await executeDql(currentDql, 50);
+            raw = result.result?.content?.[0]?.text || '';
+          } else {
+            // No repair available — log the failure
+            const lesson = `### Failed DQL Query (unfixable)\n**Query:** \`${currentDql}\`\n**Error:** ${errMsg.slice(0, 300)}\n`;
+            appendToKBDocument('dql-lessons.md', lesson).catch(() => {});
+          }
+        }
+
+        // Step 3: Format the result
         if (result.status === 'success' && raw && raw.length > 5) {
           let tableOutput = '';
           try {
@@ -581,8 +623,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           }
           insertText = `\n\n**Query Results** (${result.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}`;
         } else {
-          const errMsg = result.message || 'No data returned';
-          insertText = `\n\n*Query returned no data: ${errMsg}*`;
+          const finalErr = result.message || 'No data returned';
+          insertText = `\n\n*Query returned no data: ${finalErr}*`;
         }
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : 'Query failed';
