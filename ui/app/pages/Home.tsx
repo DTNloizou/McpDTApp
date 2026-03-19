@@ -3,7 +3,7 @@ import { Flex } from '@dynatrace/strato-components/layouts';
 import { TitleBar } from '@dynatrace/strato-components-preview/layouts';
 import { sendChat, testConnection, executeDql, getRecommendations, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
 import { loadConfig } from '../config';
-import { getKBDocuments, buildKBContext, buildKBSummary, buildKBIngestionMessage, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
+import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
 import { loadCustomCategories, getCustomCategories, saveCustomCategories, type CustomCategory, type CustomQuery } from '../custom-queries';
 
 interface Message {
@@ -189,7 +189,6 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   // Chat mode state
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [kbLoaded, setKbLoaded] = useState(false);
   const [kbDocs, setKbDocs] = useState<KBDocument[]>([]);
   const [kbUploading, setKbUploading] = useState(false);
   const kbFileInputRef = useRef<HTMLInputElement>(null);
@@ -199,7 +198,12 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   const [discoveryStatus, setDiscoveryStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle');
   const [discoveryMessage, setDiscoveryMessage] = useState('');
   const [completedDiscoveryKeys, setCompletedDiscoveryKeys] = useState<Set<string>>(new Set());
+  const [fileUploadStatus, setFileUploadStatus] = useState<Record<string, 'uploading' | 'done' | 'error'>>({});
+  const [resolvingPlaceholders, setResolvingPlaceholders] = useState(false);
+  const [viewingDoc, setViewingDoc] = useState<KBDocument | null>(null);
   const [notebookGenerating, setNotebookGenerating] = useState(false);
+  const [nlQuery, setNlQuery] = useState('');
+  const [nlGenerating, setNlGenerating] = useState(false);
 
   // Pre-built queries state
   const [customCategories, setCustomCategories] = useState<CustomCategory[]>([]);
@@ -315,12 +319,77 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     } finally { setLoading(false); }
   };
 
+  const handleNaturalLanguageQuery = async () => {
+    if (!nlQuery.trim() || nlGenerating || !connected) return;
+    const question = nlQuery.trim();
+    setNlQuery('');
+    setNlGenerating(true);
+    setOutput((prev) => [...prev, { role: 'user', content: `🔮 ${question}` }]);
+    setRecommendation(null);
+    setLastQuery(null);
+    setLoading(true);
+
+    try {
+      const dqlPrompt = [
+        `Convert this natural language question into a single DQL query for Dynatrace.`,
+        ``,
+        `Question: "${question}"`,
+        ``,
+        `DQL RULES:`,
+        `- Entity types are lowercase: dt.entity.service, dt.entity.host, dt.entity.application, dt.entity.process_group, etc.`,
+        `- Valid entity fields: entity.name, id, entity.detected_name, lifetime, tags, managementZones`,
+        `- BizEvents: fetch bizevents, from:now()-7d | summarize count = count(), by:{event.type}`,
+        `- Logs: fetch logs, from:now()-24h | fields timestamp, content, status, log.source`,
+        `- Spans: fetch spans, from:now()-1h | fields span.name, duration, status_code`,
+        `- Metrics: fetch dt.metrics | fields metric.key, metric.displayName`,
+        `- Use appropriate time ranges and limits`,
+        ``,
+        `Return ONLY the DQL query, no explanation, no markdown fences, no commentary.`,
+      ].join('\n');
+
+      const fileRefs = getDocumentFileRefs();
+      const chatResult = await sendChat(dqlPrompt, [], undefined, fileRefs.length > 0 ? fileRefs : undefined);
+      if (chatResult.status !== 'success' || !chatResult.response) {
+        setOutput((prev) => [...prev, { role: 'error', content: `Failed to generate query: ${chatResult.message || 'No response'}` }]);
+        return;
+      }
+
+      // Clean the DQL from any markdown fencing
+      let dql = chatResult.response.trim();
+      const fenceMatch = dql.match(/^```(?:dql)?\n([\s\S]*?)\n```$/);
+      if (fenceMatch) dql = fenceMatch[1].trim();
+      // Remove any leading/trailing quotes
+      if ((dql.startsWith('"') && dql.endsWith('"')) || (dql.startsWith("'") && dql.endsWith("'"))) {
+        dql = dql.slice(1, -1);
+      }
+
+      setOutput((prev) => [...prev, { role: 'assistant', content: `**Generated DQL:**\n\`\`\`\n${dql}\n\`\`\`` }]);
+
+      // Now execute the generated query
+      const result: DqlResult = await executeDql(dql);
+      if (result.status === 'success') {
+        const rawText = result.result?.content?.[0]?.text || 'Query executed successfully';
+        const formatted = formatDqlResult(rawText);
+        setOutput((prev) => [...prev, { role: 'assistant', content: formatted }]);
+        setLastQuery({ label: `🔮 ${question}`, dql, results: rawText });
+      } else {
+        setOutput((prev) => [...prev, { role: 'error', content: `Query failed: ${result.message}` }]);
+      }
+    } catch (err: unknown) {
+      setOutput((prev) => [...prev, { role: 'error', content: `Error: ${err instanceof Error ? err.message : 'Unknown'}` }]);
+    } finally {
+      setNlGenerating(false);
+      setLoading(false);
+    }
+  };
+
   const handleGenerateNotebook = async () => {
     if (!lastQuery || !recommendation || recommendation.role !== 'assistant') return;
     setNotebookGenerating(true);
     try {
       // Use KB summary to keep tokens low and avoid rate limits
-      const kbSummary = buildKBSummary(placeholderValues);
+      const fileRefs = getDocumentFileRefs();
+      const kbSummary = fileRefs.length > 0 ? undefined : buildKBSummary(placeholderValues);
 
       const prompt = [
         `Create a Dynatrace Notebook using the create-notebook tool.`,
@@ -328,9 +397,12 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         `**Notebook title:** ${lastQuery.label} — Analysis`,
         ``,
         `RULES:`,
-        `- Every DQL query MUST be an executable DQL code section (type "code", language "dql"), NOT markdown code blocks`,
-        `- VALIDATE every DQL query by running it with execute-dql BEFORE adding it to the notebook. If a query returns an error, fix the syntax and retry. Only include queries that execute successfully.`,
-        `- Each DQL code section should have a markdown section above it explaining what it investigates`,
+        `- Every DQL query MUST be an executable DQL code section (type "code", language "dql"), NOT markdown code blocks.`,
+        `- Do NOT validate or run any queries before creating the notebook — just create it directly in a single create-notebook call.`,
+        `- Do NOT call execute-dql. Only call create-notebook once with all sections.`,
+        `- Each DQL code section should have a markdown section above it explaining what it investigates.`,
+        `- Entity types in DQL are lowercase: dt.entity.service, dt.entity.host, etc.`,
+        `- Valid entity fields: entity.name, id, entity.detected_name, lifetime, tags, managementZones.`,
         ``,
         `NOTEBOOK SECTIONS:`,
         ``,
@@ -339,12 +411,12 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         `2. DQL code section — the original query:`,
         lastQuery.dql,
         ``,
-        `3. Markdown: "Root Cause Analysis" — generate 2-3 analytical DQL queries as executable code sections that:`,
+        `3. Markdown: "Root Cause Analysis" — followed by 2-3 DQL code sections that:`,
         `   - Break down errors/issues by time period (hourly bins)`,
         `   - Correlate with related services or dependencies`,
         `   - Analyse by key dimensions (customer, region, type)`,
         ``,
-        `4. Markdown: "Impact Assessment" — 1-2 DQL queries as executable code sections for:`,
+        `4. Markdown: "Impact Assessment" — followed by 1-2 DQL code sections for:`,
         `   - Quantifying affected transactions/users`,
         `   - Comparison with baseline periods`,
         ``,
@@ -357,10 +429,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         ] : []),
       ].join('\n');
 
-      const result = await sendChat(prompt, []);
+      const result = await sendChat(prompt, [], undefined, fileRefs.length > 0 ? fileRefs : undefined);
 
       if (result.status === 'success') {
         // Check if the response contains a notebook URL or ID
+        // NOTE: Notebook generation still uses remote MCP server (sendChat) because it needs the create-notebook tool
         const urlMatch = result.response?.match(/notebook\/([a-zA-Z0-9-]+)/);
         if (urlMatch) {
           window.open(`/ui/apps/dynatrace.notebooks/notebook/${urlMatch[1]}`, '_blank');
@@ -386,9 +459,10 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     setRecoLoading(true);
     setRecommendation(null);
     try {
-      // Send condensed KB summary instead of full docs to avoid 504 timeouts
-      const kbSummary = buildKBSummary(placeholderValues);
-      const result: ChatResponse = await getRecommendations(lastQuery.label, lastQuery.dql, lastQuery.results, kbSummary || undefined);
+      // Pass file references if docs are synced to Anthropic, otherwise fall back to inline summary
+      const fileRefs = getDocumentFileRefs();
+      const kbSummary = fileRefs.length > 0 ? undefined : buildKBSummary(placeholderValues);
+      const result: ChatResponse = await getRecommendations(lastQuery.label, lastQuery.dql, lastQuery.results, kbSummary || undefined, undefined, fileRefs.length > 0 ? fileRefs : undefined);
       if (result.status === 'success') {
         setRecommendation({ role: 'assistant', content: result.response, toolCalls: result.toolCalls });
         // Auto-save findings to KB so the AI remembers them in future sessions
@@ -410,59 +484,60 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     }
     setDiscoveryStatus('running');
     setDiscoveryMessage('');
+
     const allTasks = buildDiscoveryTasks(placeholderValues);
     if (allTasks.length === 0) { setDiscoveryStatus('error'); setDiscoveryMessage('No discovery tables found in documents.'); return; }
 
-    // Only run tasks not yet completed
+    // On re-run, only process tasks that haven't succeeded yet
     const pendingTasks = allTasks.filter((t) => !completedDiscoveryKeys.has(t.key));
-    if (pendingTasks.length === 0) {
-      setDiscoveryStatus('success');
-      setDiscoveryMessage('All discovery tables already completed.');
-      return;
-    }
+    if (pendingTasks.length === 0) { setDiscoveryStatus('success'); setDiscoveryMessage('All tables already populated.'); return; }
 
     const newCompleted = new Set(completedDiscoveryKeys);
-    const results: string[] = [];
 
-    // ── Phase 1: One Claude call to generate DQL queries for all pending tables ──
-    setDiscoveryMessage(`Generating DQL queries for ${pendingTasks.length} tables...`);
-    const queryPrompt = buildQueryGenerationPrompt(pendingTasks);
-    let queryPlans: { key: string; dql: string }[] = [];
+    // ── Phase 1: Generate DQL queries in small batches (3 tables per call) ──
+    const BATCH_SIZE = 3;
+    const queryPlans: { key: string; dql: string }[] = [];
+    const totalBatches = Math.ceil(pendingTasks.length / BATCH_SIZE);
 
-    const MAX_RETRIES = 3;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
-        const waitSec = Math.min(60, 15 * attempt);
-        setDiscoveryMessage(`Rate limited — retrying query generation in ${waitSec}s...`);
-        await new Promise((r) => setTimeout(r, waitSec * 1000));
-      }
-      try {
-        const chatResult = await sendChat(queryPrompt, []);
-        if (chatResult.status === 'success' && chatResult.response) {
-          // Extract JSON from response (may be wrapped in markdown fences)
-          const jsonStr = chatResult.response.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
-          queryPlans = JSON.parse(jsonStr);
+    for (let b = 0; b < totalBatches; b++) {
+      const batchTasks = pendingTasks.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+      setDiscoveryMessage(`Generating DQL queries — batch ${b + 1}/${totalBatches} (${batchTasks.length} tables)...`);
+
+      const queryPrompt = buildQueryGenerationPrompt(batchTasks);
+      let batchPlans: { key: string; dql: string }[] = [];
+
+      const MAX_RETRIES = 3;
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          const waitSec = Math.min(60, 15 * attempt);
+          setDiscoveryMessage(`Batch ${b + 1}/${totalBatches}: retrying in ${waitSec}s (attempt ${attempt + 1})...`);
+          await new Promise((r) => setTimeout(r, waitSec * 1000));
+        }
+        try {
+          const chatResult = await sendChat(queryPrompt, []);
+          if (chatResult.status === 'success' && chatResult.response) {
+            const jsonStr = chatResult.response.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
+            batchPlans = JSON.parse(jsonStr);
+            break;
+          }
+          const msg = chatResult.message || '';
+          if (msg.includes('429') || msg.includes('504') || msg.toLowerCase().includes('rate limit') || msg.toLowerCase().includes('timeout')) continue;
+          // Non-retryable error — skip this batch
+          break;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : 'Unknown error';
+          const retryable = msg.includes('429') || msg.includes('504') || msg.toLowerCase().includes('rate limit') || msg.toLowerCase().includes('timeout');
+          if (retryable && attempt < MAX_RETRIES - 1) continue;
+          // JSON parse error or final attempt — skip this batch
           break;
         }
-        const msg = chatResult.message || '';
-        if (msg.includes('429') || msg.toLowerCase().includes('rate limit')) continue;
-        setDiscoveryStatus('error');
-        setDiscoveryMessage(`Query generation failed: ${msg}`);
-        return;
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : 'Unknown error';
-        if ((msg.includes('429') || msg.toLowerCase().includes('rate limit')) && attempt < MAX_RETRIES - 1) continue;
-        // Try to parse JSON error — might be a parse failure
-        if (msg.includes('JSON')) {
-          setDiscoveryStatus('error');
-          setDiscoveryMessage('Claude returned invalid JSON. Try again.');
-          return;
-        }
-        if (attempt === MAX_RETRIES - 1) {
-          setDiscoveryStatus('error');
-          setDiscoveryMessage(msg);
-          return;
-        }
+      }
+
+      queryPlans.push(...batchPlans);
+
+      // Pause between batches to avoid rate limits
+      if (b < totalBatches - 1) {
+        await new Promise((r) => setTimeout(r, 5000));
       }
     }
 
@@ -472,79 +547,169 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       return;
     }
 
-    // ── Phase 2: Run DQL queries directly (no Claude) ──
+    // ── Phase 2: Run DQL queries, collect raw results per document ──
     setDiscoveryMessage(`Running ${queryPlans.length} DQL queries...`);
+
+    const discoveryLog: string[] = [];
+    // Group results by document name for Phase 3
+    const resultsByDoc = new Map<string, { section: string; dql: string; rawResult: string }[]>();
 
     for (let i = 0; i < queryPlans.length; i++) {
       const plan = queryPlans[i];
-      const task = pendingTasks.find((t) => t.key === plan.key);
+      const task = allTasks.find((t) => t.key === plan.key);
       const label = task?.label || plan.key;
       setDiscoveryMessage(`Querying ${i + 1}/${queryPlans.length}: ${label}...`);
+
+      // Throttle: max 5 tool calls per 20s → space them 4.5s apart
+      if (i > 0) {
+        await new Promise((r) => setTimeout(r, 4500));
+      }
+
+      const sepIdx = plan.key.indexOf('::');
+      const docName = sepIdx >= 0 ? plan.key.slice(0, sepIdx) : plan.key;
+      const sectionName = sepIdx >= 0 ? plan.key.slice(sepIdx + 2) : '';
 
       try {
         const dqlResult = await executeDql(plan.dql, 50);
         if (dqlResult.status === 'success') {
-          const rawText = dqlResult.result?.content?.[0]?.text || 'No data returned';
-          // Try to format as markdown table
-          let formatted = rawText;
-          try {
-            const jsonMatch = rawText.match(/```json\n([\s\S]*?)\n```/);
-            if (jsonMatch) {
-              const data = JSON.parse(jsonMatch[1]);
-              if (Array.isArray(data) && data.length > 0) {
-                const cols = Object.keys(data[0]);
-                formatted = '| ' + cols.join(' | ') + ' |\n';
-                formatted += '| ' + cols.map(() => '---').join(' | ') + ' |\n';
-                data.forEach((row: Record<string, unknown>) => {
-                  formatted += '| ' + cols.map((c) => {
-                    const v = row[c];
-                    if (v === null || v === undefined) return '-';
-                    const s = String(v);
-                    return s.length > 80 ? s.substring(0, 77) + '...' : s;
-                  }).join(' | ') + ' |\n';
-                });
-                formatted = `${data.length} record${data.length === 1 ? '' : 's'} found\n\n${formatted}`;
-              }
-            }
-          } catch { /* use raw text */ }
-          results.push(`## ${label}\n\n${formatted}`);
-          newCompleted.add(plan.key);
-          setCompletedDiscoveryKeys(new Set(newCompleted));
+          const rawText = dqlResult.result?.content?.[0]?.text || '';
+          if (rawText && rawText.length > 5) {
+            if (!resultsByDoc.has(docName)) resultsByDoc.set(docName, []);
+            resultsByDoc.get(docName)!.push({ section: sectionName, dql: plan.dql, rawResult: rawText });
+            discoveryLog.push(`✅ ${label}: data received`);
+          } else {
+            discoveryLog.push(`⚠️ ${label}: empty result`);
+          }
         } else {
-          results.push(`## ${label}\n\n_Query failed: ${dqlResult.message || 'Unknown error'}_\n\nDQL: \`${plan.dql}\``);
+          const errMsg = dqlResult.message || 'DQL query failed';
+          discoveryLog.push(`❌ ${label}: ${errMsg}`);
         }
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Unknown error';
-        results.push(`## ${label}\n\n_Error: ${msg}_\n\nDQL: \`${plan.dql}\``);
+        discoveryLog.push(`❌ ${label}: ${msg}`);
       }
 
-      // Save after each query so progress isn't lost
-      await saveDiscoveryStatus(Array.from(newCompleted));
-      const progressContent = `# AI Discovery Results\n\n_Generated: ${new Date().toLocaleString()}_\n_Tables discovered: ${results.length}/${queryPlans.length}_\n\n${results.join('\n\n---\n\n')}`;
-      await addKBDocument('AI_Discovery_Results.md', progressContent);
+      // Only save progress periodically (completed keys updated in Phase 3)
+      setKbDocs(getKBDocuments());
+    }
+
+    // ── Phase 3: Ask Claude to update each document with its query results ──
+    const docsToUpdate = Array.from(resultsByDoc.entries());
+    if (docsToUpdate.length === 0) {
+      setDiscoveryStatus('error');
+      setDiscoveryMessage(`No query results to populate.\n${discoveryLog.join('\n')}`);
+      return;
+    }
+
+    for (let d = 0; d < docsToUpdate.length; d++) {
+      const [docName, sectionResults] = docsToUpdate[d];
+      setDiscoveryMessage(`Updating document ${d + 1}/${docsToUpdate.length}: ${docName}...`);
+
+      const doc = getKBDocuments().find((dd) => dd.name === docName);
+      if (!doc) {
+        discoveryLog.push(`⚠️ ${docName}: document not found, skipping update`);
+        continue;
+      }
+
+      // Apply placeholder replacements before sending to Claude
+      const resolvedContent = applyReplacements(doc.content, placeholderValues);
+
+      // Build the results summary for this document
+      const resultsSummary = sectionResults.map((r, idx) =>
+        `### Result ${idx + 1}: ${r.section}\nDQL: \`${r.dql}\`\nRaw output:\n${r.rawResult.length > 3000 ? r.rawResult.substring(0, 3000) + '\n...(truncated)' : r.rawResult}`
+      ).join('\n\n');
+
+      const updatePrompt = [
+        `You are updating a Dynatrace reference document with real data from DQL queries.`,
+        ``,
+        `Here is the current document:`,
+        `\`\`\`markdown`,
+        resolvedContent,
+        `\`\`\``,
+        ``,
+        `Here are the DQL query results to populate into the document:`,
+        resultsSummary,
+        ``,
+        `INSTRUCTIONS:`,
+        `1. Find all tables that have template/placeholder rows (marked with "*(Add as discovered)*" or "⏳" or similar placeholder text) and replace them with REAL data rows from the query results above.`,
+        `2. Match each query result to its corresponding section by the section name.`,
+        `3. Keep the existing table headers — only replace the placeholder DATA rows with real data.`,
+        `4. If a query returned JSON records, convert them to pipe-delimited markdown table rows matching the table's columns.`,
+        `5. If a section already has real data (not placeholder rows), leave it as-is.`,
+        `6. Keep ALL other content exactly as-is — headings, code blocks, notes, non-template tables, etc.`,
+        `7. Do NOT add any commentary, explanation, or markdown fences around the output.`,
+        `8. Return the COMPLETE updated document content, not just the changed parts.`,
+      ].join('\n');
+
+      const MAX_RETRIES = 3;
+      let updated = false;
+      for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          const waitSec = Math.min(60, 15 * attempt);
+          setDiscoveryMessage(`Updating ${docName}: retrying in ${waitSec}s...`);
+          await new Promise((r) => setTimeout(r, waitSec * 1000));
+        }
+        try {
+          const chatResult = await sendChat(updatePrompt, []);
+          if (chatResult.status === 'success' && chatResult.response) {
+            // Strip any markdown fences Claude might wrap around the output
+            let updatedContent = chatResult.response.trim();
+            const fenceMatch = updatedContent.match(/^```(?:markdown)?\n([\s\S]*)\n```$/);
+            if (fenceMatch) updatedContent = fenceMatch[1];
+
+            // Sanity check: updated content should be at least 50% the size of original
+            if (updatedContent.length >= resolvedContent.length * 0.5) {
+              await addKBDocument(docName, updatedContent);
+              discoveryLog.push(`📝 ${docName}: updated with ${sectionResults.length} section(s) of data`);
+              updated = true;
+            } else {
+              discoveryLog.push(`⚠️ ${docName}: Claude response too short (${updatedContent.length} vs ${resolvedContent.length}), skipped`);
+            }
+            break;
+          }
+          const msg = chatResult.message || '';
+          const retryable = msg.includes('429') || msg.includes('504') || msg.toLowerCase().includes('rate limit') || msg.toLowerCase().includes('timeout');
+          if (!retryable) {
+            discoveryLog.push(`❌ ${docName}: ${msg}`);
+            break;
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : 'Unknown error';
+          const retryable = msg.includes('429') || msg.includes('504') || msg.toLowerCase().includes('rate limit') || msg.toLowerCase().includes('timeout');
+          if (!retryable || attempt === MAX_RETRIES - 1) {
+            discoveryLog.push(`❌ ${docName}: ${msg}`);
+            break;
+          }
+        }
+      }
+
+      if (!updated) {
+        discoveryLog.push(`⚠️ ${docName}: update failed after retries`);
+      } else {
+        // Mark all sections for this doc as completed
+        for (const sr of sectionResults) {
+          newCompleted.add(`${docName}::${sr.section}`);
+        }
+        setCompletedDiscoveryKeys(new Set(newCompleted));
+        await saveDiscoveryStatus(Array.from(newCompleted));
+      }
+
+      // Pause between document updates
+      if (d < docsToUpdate.length - 1) {
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+
       setKbDocs(getKBDocuments());
     }
 
     setDiscoveryStatus('success');
-    const remaining = allTasks.length - newCompleted.size;
-    setDiscoveryMessage(remaining === 0
-      ? `All ${allTasks.length} tables discovered.`
-      : `${newCompleted.size}/${allTasks.length} tables done — ${remaining} remaining.`);
+    setDiscoveryMessage(`Discovery complete.\n${discoveryLog.join('\n')}`);
+    // Refresh doc list and re-detect template rows (some may now be populated)
+    setKbDocs(getKBDocuments());
+    setDiscoveryPlaceholders(detectDiscoveryPlaceholders());
   };
 
-  const handleLoadContext = async () => {
-    const ingestionMsg = buildKBIngestionMessage(placeholderValues);
-    if (!ingestionMsg || loading) return;
-    await handleChatSend(ingestionMsg);
-    setKbLoaded(true);
-  };
-
-  // Auto-load KB docs when entering chat view with docs available
-  useEffect(() => {
-    if (viewMode === 'chat' && connected && !kbLoaded && !loading && getKBDocuments().length > 0 && messages.length === 0) {
-      handleLoadContext();
-    }
-  }, [viewMode, connected]);
+  // handleLoadContext removed — file_ids are passed with each request now
 
   const handleChatSend = async (text?: string) => {
     const msg = text || input.trim();
@@ -553,8 +718,13 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     setMessages((prev) => [...prev, { role: 'user', content: msg }]);
     setLoading(true);
     try {
-      const history = messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => ({ role: m.role, content: m.content }));
-      const result = await sendChat(msg, history);
+      // Keep last 10 messages to avoid oversized payloads
+      const history = messages
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .slice(-10)
+        .map((m) => ({ role: m.role, content: m.content }));
+      const fileRefs = getDocumentFileRefs();
+      const result = await sendChat(msg, history, undefined, fileRefs.length > 0 ? fileRefs : undefined);
       if (result.status === 'success') {
         setMessages((prev) => [...prev, { role: 'assistant', content: result.response, toolCalls: result.toolCalls }]);
       } else {
@@ -585,9 +755,34 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     setPlaceholders(detectPlaceholders());
     setDiscoveryPlaceholders(detectDiscoveryPlaceholders());
     setKbUploading(false);
+
+    // Auto-upload to Anthropic Files API (with placeholder replacements applied)
+    const config = loadConfig();
+    const anthropicKey = config.agent?.apiKey;
+    if (anthropicKey) {
+      const currentDocs = getKBDocuments();
+      for (const file of fileArray) {
+        setFileUploadStatus((prev) => ({ ...prev, [file.name]: 'uploading' }));
+        try {
+          const doc = currentDocs.find((d) => d.name === file.name);
+          const content = applyReplacements(doc?.content ?? await file.text(), placeholderValues);
+          await uploadDocToAnthropic(file.name, content, anthropicKey);
+          setFileUploadStatus((prev) => ({ ...prev, [file.name]: 'done' }));
+        } catch {
+          setFileUploadStatus((prev) => ({ ...prev, [file.name]: 'error' }));
+        }
+      }
+      setKbDocs(getKBDocuments());
+    }
   };
 
   const handleKBRemove = async (name: string) => {
+    // Delete from Anthropic if synced
+    const config = loadConfig();
+    const anthropicKey = config.agent?.apiKey;
+    if (anthropicKey) {
+      try { await deleteDocFromAnthropic(name, anthropicKey); } catch { /* best-effort */ }
+    }
     await removeKBDocument(name);
     setKbDocs(getKBDocuments());
     setPlaceholders(detectPlaceholders());
@@ -600,6 +795,60 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       savePlaceholderValues(next);
       return next;
     });
+  };
+
+  const handleAutoResolvePlaceholders = async () => {
+    if (resolvingPlaceholders || placeholders.length === 0) return;
+    if (!connected) await handleConnect();
+    setResolvingPlaceholders(true);
+
+    // Only resolve unfilled placeholders
+    const unfilled = placeholders.filter((ph) => !placeholderValues[ph.token]?.trim());
+    if (unfilled.length === 0) { setResolvingPlaceholders(false); return; }
+
+    const prompt = [
+      `I have reference documents with placeholder tokens that need to be replaced with real values from my Dynatrace environment.`,
+      `Use your MCP tools to query Dynatrace and figure out the correct value for each placeholder below.`,
+      ``,
+      `Placeholders to resolve:`,
+      ...unfilled.map((ph) => `- ${ph.token} (friendly name: "${ph.friendlyName}", appears ${ph.occurrences} time${ph.occurrences === 1 ? '' : 's'})`),
+      ``,
+      `Guidelines:`,
+      `- [TENANT_ID] or [ENVIRONMENT_ID]: use the Dynatrace environment/tenant ID`,
+      `- [CLIENT_NAME] or [COMPANY_NAME]: use the Dynatrace environment name or organisation name`,
+      `- [ENVIRONMENT_URL]: use the Dynatrace environment URL`,
+      `- For entity-related placeholders: query the relevant entity type and use the most prominent result`,
+      `- For date/time placeholders: use today's date in ISO format`,
+      `- If you genuinely cannot determine a value, use "UNKNOWN" as the value`,
+      ``,
+      `Return ONLY a valid JSON object (no markdown fences, no explanation) mapping each placeholder token to its resolved value.`,
+      `Example: {"[TENANT_ID]": "abc12345", "[CLIENT_NAME]": "Acme Corp"}`,
+    ].join('\n');
+
+    try {
+      const result = await sendChat(prompt, []);
+      if (result.status === 'success' && result.response) {
+        // Extract JSON from response (may be wrapped in markdown fences)
+        const jsonStr = result.response.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
+        const resolved: Record<string, string> = JSON.parse(jsonStr);
+
+        // Apply resolved values
+        setPlaceholderValues((prev) => {
+          const next = { ...prev };
+          for (const [token, value] of Object.entries(resolved)) {
+            if (value && value !== 'UNKNOWN') {
+              next[token] = value;
+            }
+          }
+          savePlaceholderValues(next);
+          return next;
+        });
+      }
+    } catch {
+      // Silently fail — user can still fill manually
+    } finally {
+      setResolvingPlaceholders(false);
+    }
   };
 
   // Merge built-in + custom categories for the explorer
@@ -676,13 +925,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 Uploaded Documents
               </div>
               {kbDocs.map((doc) => {
-                // Compute discovery status for this doc
-                const docDiscoveryKeys = new Set<string>();
-                for (const dp of discoveryPlaceholders) {
-                  if (dp.docName === doc.name) docDiscoveryKeys.add(`${dp.docName}::${dp.section}`);
-                }
-                const totalTables = docDiscoveryKeys.size;
-                const completedTables = totalTables > 0 ? Array.from(docDiscoveryKeys).filter((k) => completedDiscoveryKeys.has(k)).length : 0;
+                const syncStatus = getDocSyncStatus(doc.name);
+                const uploadStatus = fileUploadStatus[doc.name];
+                const isSynced = syncStatus === 'synced';
 
                 return (
                 <div
@@ -693,30 +938,73 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                     gap: 10,
                     padding: '10px 14px',
                     borderRadius: 8,
-                    border: '1px solid ' + (totalTables > 0 && completedTables === totalTables ? 'rgba(0,168,107,0.3)' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'),
-                    background: totalTables > 0 && completedTables === totalTables ? 'rgba(0,168,107,0.04)' : 'var(--dt-colors-background-base-default, #fff)',
+                    border: '1px solid ' + (isSynced ? 'rgba(0,168,107,0.3)' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'),
+                    background: isSynced ? 'rgba(0,168,107,0.04)' : 'var(--dt-colors-background-base-default, #fff)',
                   }}
                 >
-                  <span style={{ fontSize: 18 }}>📄</span>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span style={{ fontSize: 18 }}>{isSynced ? '☁️' : '📄'}</span>
+                  <div
+                    style={{ flex: 1, minWidth: 0, cursor: 'pointer' }}
+                    onClick={() => setViewingDoc(doc)}
+                    title="Click to view document"
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textDecoration: 'underline', textDecorationColor: 'rgba(0,0,0,0.15)', textUnderlineOffset: '2px' }}>
                       {doc.name}
                     </div>
                     <div style={{ fontSize: 11, color: '#999', marginTop: 2 }}>
                       {(doc.content.length / 1024).toFixed(1)} KB • {new Date(doc.addedAt).toLocaleDateString()}
                     </div>
                   </div>
-                  {totalTables > 0 && (
+                  {isSynced && doc.fileId ? (
+                    <span style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 5,
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: '3px 8px',
+                      borderRadius: 10,
+                      background: '#00a86b',
+                      color: '#fff',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      ✓ {doc.fileId}
+                    </span>
+                  ) : uploadStatus === 'uploading' ? (
                     <span style={{
                       fontSize: 11,
                       fontWeight: 600,
                       padding: '3px 8px',
                       borderRadius: 10,
-                      background: completedTables === totalTables ? '#00a86b' : completedTables > 0 ? '#ff9500' : '#e0e0e0',
-                      color: completedTables > 0 ? '#fff' : '#666',
+                      background: '#ff9500',
+                      color: '#fff',
                       whiteSpace: 'nowrap',
                     }}>
-                      {completedTables === totalTables ? `✓ ${completedTables}/${totalTables}` : `${completedTables}/${totalTables}`}
+                      ↻ Uploading...
+                    </span>
+                  ) : uploadStatus === 'error' ? (
+                    <span style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: '3px 8px',
+                      borderRadius: 10,
+                      background: '#e32017',
+                      color: '#fff',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      ✕ Failed
+                    </span>
+                  ) : (
+                    <span style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      padding: '3px 8px',
+                      borderRadius: 10,
+                      background: '#e0e0e0',
+                      color: '#666',
+                      whiteSpace: 'nowrap',
+                    }}>
+                      Not synced
                     </span>
                   )}
                   <button
@@ -741,11 +1029,32 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
               {/* Placeholder replacement */}
               {placeholders.length > 0 && (
                 <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(255,149,0,0.06) 0%, rgba(255,100,0,0.06) 100%)', border: '1px solid rgba(255,149,0,0.25)' }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 4 }}>
-                    🔧 Replace Placeholders
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)' }}>
+                      🔧 Replace Placeholders
+                    </div>
+                    {placeholders.some((ph) => !placeholderValues[ph.token]?.trim()) && (
+                      <button
+                        onClick={handleAutoResolvePlaceholders}
+                        disabled={resolvingPlaceholders}
+                        style={{
+                          padding: '5px 12px',
+                          borderRadius: 6,
+                          border: '1px solid rgba(105,80,161,0.3)',
+                          background: resolvingPlaceholders ? 'rgba(105,80,161,0.08)' : 'rgba(105,80,161,0.12)',
+                          color: '#6950a1',
+                          fontSize: 11,
+                          fontWeight: 600,
+                          cursor: resolvingPlaceholders ? 'not-allowed' : 'pointer',
+                          opacity: resolvingPlaceholders ? 0.7 : 1,
+                        }}
+                      >
+                        {resolvingPlaceholders ? '⏳ Resolving...' : '🤖 Ask Claude'}
+                      </button>
+                    )}
                   </div>
                   <div style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>
-                    {placeholders.length} placeholder{placeholders.length === 1 ? '' : 's'} detected. Fill in values below — they'll be replaced before loading into AI.
+                    {placeholders.length} placeholder{placeholders.length === 1 ? '' : 's'} detected. Claude can auto-resolve these from your Dynatrace environment, or fill them in manually.
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                     {placeholders.map((ph) => (
@@ -784,21 +1093,81 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 </div>
               )}
 
-              {/* AI Discovery — populate template rows via MCP */}
-              <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(0,168,107,0.08) 0%, rgba(0,152,212,0.08) 100%)', border: '1px solid ' + (discoveryStatus === 'success' ? 'rgba(0,168,107,0.3)' : discoveryStatus === 'error' ? 'rgba(227,32,23,0.3)' : 'rgba(0,152,212,0.25)') }}>
+              {/* Upload status summary */}
+              {(() => {
+                const totalDocs = kbDocs.length;
+                const syncedDocs = kbDocs.filter((d) => getDocSyncStatus(d.name) === 'synced').length;
+                const hasApiKey = !!loadConfig().agent?.apiKey;
+                const allSynced = syncedDocs === totalDocs && totalDocs > 0;
+                const hasPending = syncedDocs < totalDocs;
+
+                return (
+                <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(0,168,107,0.08) 0%, rgba(0,152,212,0.08) 100%)', border: '1px solid ' + (allSynced ? 'rgba(0,168,107,0.3)' : 'rgba(0,152,212,0.25)') }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
+                        {allSynced
+                          ? `✅ All ${totalDocs} document${totalDocs === 1 ? '' : 's'} synced to Claude`
+                          : `☁️ ${syncedDocs}/${totalDocs} document${totalDocs === 1 ? '' : 's'} synced`}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#888' }}>
+                        {!hasApiKey
+                          ? 'Set your Anthropic API key in Settings to enable file syncing.'
+                          : allSynced
+                            ? 'All documents are uploaded to Anthropic and referenced by file_id in conversations.'
+                            : `${totalDocs - syncedDocs} document${totalDocs - syncedDocs === 1 ? '' : 's'} pending upload. Click Sync to upload now.`}
+                      </div>
+                    </div>
+                    {hasApiKey && hasPending && (
+                      <button
+                        onClick={async () => {
+                          const config = loadConfig();
+                          const anthropicKey = config.agent?.apiKey;
+                          if (!anthropicKey) return;
+                          const pending = kbDocs.filter((d) => getDocSyncStatus(d.name) !== 'synced');
+                          for (const doc of pending) {
+                            setFileUploadStatus((prev) => ({ ...prev, [doc.name]: 'uploading' }));
+                            try {
+                              const content = applyReplacements(doc.content, placeholderValues);
+                              await uploadDocToAnthropic(doc.name, content, anthropicKey);
+                              setFileUploadStatus((prev) => ({ ...prev, [doc.name]: 'done' }));
+                            } catch {
+                              setFileUploadStatus((prev) => ({ ...prev, [doc.name]: 'error' }));
+                            }
+                          }
+                          setKbDocs(getKBDocuments());
+                        }}
+                        style={{
+                          ...recoBtnStyle,
+                          fontSize: 13,
+                          padding: '10px 18px',
+                          background: '#1496ff',
+                        }}
+                      >
+                        ☁ Sync to Claude
+                      </button>
+                    )}
+                  </div>
+                </div>
+                );
+              })()}
+
+              {/* AI Discovery — populate *(Add as discovered)* template rows */}
+              {discoveryPlaceholders.length > 0 && (
+              <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(20,150,255,0.08) 0%, rgba(105,80,161,0.08) 100%)', border: '1px solid ' + (discoveryStatus === 'success' ? 'rgba(0,168,107,0.3)' : discoveryStatus === 'error' ? 'rgba(227,32,23,0.3)' : 'rgba(20,150,255,0.25)') }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
-                      {discoveryStatus === 'success' && completedDiscoveryKeys.size > 0 ? '✅ AI Discovery Complete' : discoveryStatus === 'error' ? '❌ AI Discovery Failed' : discoveryStatus === 'running' ? '⏳ Running AI Discovery...' : '🤖 AI Update Placeholders'}
+                      {discoveryStatus === 'success' && completedDiscoveryKeys.size > 0 ? '✅ Template tables populated' : discoveryStatus === 'error' ? '❌ Discovery failed' : discoveryStatus === 'running' ? '⏳ Populating tables...' : '🔍 Populate template tables'}
                     </div>
-                    <div style={{ fontSize: 11, color: '#888' }}>
+                    <div style={{ fontSize: 11, color: '#888', whiteSpace: 'pre-wrap', maxHeight: 160, overflowY: 'auto' }}>
                       {discoveryStatus === 'running'
                         ? discoveryMessage || 'Starting discovery...'
                         : discoveryStatus === 'success'
                           ? discoveryMessage
                           : discoveryStatus === 'error'
                             ? discoveryMessage
-                            : 'Ask Claude to use MCP tools to populate all template rows in your reference files.'}
+                            : `${discoveryPlaceholders.length} template row${discoveryPlaceholders.length === 1 ? '' : 's'} found. Run discovery to populate them with real Dynatrace data.`}
                     </div>
                   </div>
                   <button
@@ -808,46 +1177,12 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                       ...recoBtnStyle,
                       fontSize: 13,
                       padding: '10px 18px',
-                      background: discoveryStatus === 'success' ? '#00a86b' : discoveryStatus === 'error' ? '#e32017' : '#1496ff',
+                      background: discoveryStatus === 'success' ? '#00a86b' : discoveryStatus === 'error' ? '#e32017' : '#6950a1',
                       opacity: discoveryStatus === 'running' ? 0.5 : 1,
                       cursor: discoveryStatus === 'running' ? 'not-allowed' : 'pointer',
                     }}
                   >
-                    {discoveryStatus === 'running' ? '⏳ Running...' : discoveryStatus === 'success' && completedDiscoveryKeys.size > 0 ? '🔄 Update Remaining' : discoveryStatus === 'error' ? '🔄 Retry' : '🤖 Run AI Discovery'}
-                  </button>
-                </div>
-              </div>
-
-              {/* Load into AI context — only available after successful discovery */}
-              {(discoveryStatus === 'success' || completedDiscoveryKeys.size > 0) && (
-              <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(105,80,161,0.08) 0%, rgba(20,150,255,0.08) 100%)', border: '1px solid rgba(105,80,161,0.2)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
-                      {kbLoaded ? '✅ Documents loaded into AI context' : 'Ready to load into AI context'}
-                    </div>
-                    <div style={{ fontSize: 11, color: '#888' }}>
-                      {kbLoaded
-                        ? 'The AI is using these documents in the current chat session.'
-                        : 'Send these documents to the AI so it can reference them when answering your queries.'}
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => {
-                      setKbLoaded(false);
-                      setMessages([]);
-                      setViewMode('chat');
-                    }}
-                    disabled={!connected}
-                    style={{
-                      ...recoBtnStyle,
-                      fontSize: 13,
-                      padding: '10px 18px',
-                      opacity: !connected ? 0.5 : 1,
-                      cursor: !connected ? 'not-allowed' : 'pointer',
-                    }}
-                  >
-                    🧠 {kbLoaded ? 'Reload Context' : 'Load into AI'}
+                    {discoveryStatus === 'running' ? '⏳ Running...' : discoveryStatus === 'success' ? '🔄 Re-run' : discoveryStatus === 'error' ? '🔄 Retry' : '🔍 Discover'}
                   </button>
                 </div>
               </div>
@@ -855,6 +1190,261 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             </div>
           )}
         </div>
+
+        {/* Document viewer overlay */}
+        {viewingDoc && (
+          <>
+            <div
+              onClick={() => setViewingDoc(null)}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                background: 'rgba(0,0,0,0.4)',
+                zIndex: 50,
+              }}
+            />
+            <div
+              style={{
+                position: 'absolute',
+                top: 20,
+                left: 20,
+                right: 20,
+                bottom: 20,
+                background: 'var(--dt-colors-background-base-default, #fff)',
+                borderRadius: 12,
+                boxShadow: '0 8px 32px rgba(0,0,0,0.2)',
+                zIndex: 51,
+                display: 'flex',
+                flexDirection: 'column',
+                overflow: 'hidden',
+              }}
+            >
+              {/* Viewer header */}
+              <div
+                style={{
+                  padding: '12px 20px',
+                  borderBottom: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 10,
+                  flexShrink: 0,
+                }}
+              >
+                <span style={{ fontSize: 16 }}>📄</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {viewingDoc.name}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#999' }}>
+                    {(viewingDoc.content.length / 1024).toFixed(1)} KB • {new Date(viewingDoc.addedAt).toLocaleDateString()} • Read-only
+                  </div>
+                </div>
+                <button
+                  onClick={() => setViewingDoc(null)}
+                  style={{
+                    background: 'none',
+                    border: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)',
+                    borderRadius: 6,
+                    cursor: 'pointer',
+                    fontSize: 13,
+                    fontWeight: 600,
+                    padding: '6px 14px',
+                    color: 'var(--dt-colors-text-primary-default, #666)',
+                  }}
+                >
+                  ✕ Close
+                </button>
+              </div>
+              {/* Viewer content — lightweight markdown rendering */}
+              <div
+                style={{
+                  flex: 1,
+                  overflowY: 'auto',
+                  padding: '20px 24px',
+                  fontSize: 13,
+                  lineHeight: 1.6,
+                  color: 'var(--dt-colors-text-primary-default, #2c2d4d)',
+                  userSelect: 'text',
+                }}
+              >
+                {(() => {
+                  const raw = applyReplacements(viewingDoc.content, placeholderValues);
+                  const lines = raw.split('\n');
+                  const elements: React.ReactNode[] = [];
+                  let i = 0;
+
+                  // Inline formatting helper
+                  const renderInline = (text: string): React.ReactNode => {
+                    // Bold + italic, bold, italic, inline code, links
+                    const parts: React.ReactNode[] = [];
+                    // eslint-disable-next-line no-useless-escape
+                    const re = /(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*\(([^)]+)\)\*|\*(.+?)\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\))/g;
+                    let lastIdx = 0;
+                    let m: RegExpExecArray | null;
+                    let pIdx = 0;
+                    while ((m = re.exec(text)) !== null) {
+                      if (m.index > lastIdx) parts.push(text.slice(lastIdx, m.index));
+                      if (m[2]) parts.push(<strong key={pIdx}><em>{m[2]}</em></strong>);
+                      else if (m[3]) parts.push(<strong key={pIdx}>{m[3]}</strong>);
+                      else if (m[4]) {
+                        // *(Add as discovered)* style — highlight as pending
+                        parts.push(
+                          <span key={pIdx} style={{ background: 'rgba(255,149,0,0.15)', color: '#b36305', padding: '1px 4px', borderRadius: 3, fontSize: 11, fontStyle: 'italic' }}>
+                            ⏳ {m[4]}
+                          </span>
+                        );
+                      }
+                      else if (m[5]) parts.push(<em key={pIdx}>{m[5]}</em>);
+                      else if (m[6]) parts.push(<code key={pIdx} style={{ background: 'rgba(0,0,0,0.06)', padding: '1px 4px', borderRadius: 3, fontFamily: "'SF Mono', monospace", fontSize: 11 }}>{m[6]}</code>);
+                      else if (m[7] && m[8]) parts.push(<span key={pIdx} style={{ color: '#1496ff', textDecoration: 'underline' }}>{m[7]}</span>);
+                      pIdx++;
+                      lastIdx = m.index + m[0].length;
+                    }
+                    if (lastIdx < text.length) parts.push(text.slice(lastIdx));
+                    return parts.length === 1 && typeof parts[0] === 'string' ? parts[0] : <>{parts}</>;
+                  };
+
+                  while (i < lines.length) {
+                    const line = lines[i];
+
+                    // Code block
+                    if (line.startsWith('```')) {
+                      const lang = line.slice(3).trim();
+                      const codeLines: string[] = [];
+                      i++;
+                      while (i < lines.length && !lines[i].startsWith('```')) {
+                        codeLines.push(lines[i]);
+                        i++;
+                      }
+                      i++; // skip closing ```
+                      elements.push(
+                        <pre key={elements.length} style={{ background: 'rgba(0,0,0,0.04)', border: '1px solid rgba(0,0,0,0.08)', borderRadius: 6, padding: '12px 14px', margin: '8px 0', overflowX: 'auto', fontFamily: "'SF Mono', monospace", fontSize: 11, lineHeight: 1.5 }}>
+                          {lang && <div style={{ fontSize: 10, color: '#999', marginBottom: 6, textTransform: 'uppercase' }}>{lang}</div>}
+                          <code>{codeLines.join('\n')}</code>
+                        </pre>
+                      );
+                      continue;
+                    }
+
+                    // Headings
+                    const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
+                    if (headingMatch) {
+                      const level = headingMatch[1].length;
+                      const sizes = [22, 18, 15, 14, 13, 12];
+                      elements.push(
+                        <div key={elements.length} style={{ fontSize: sizes[level - 1], fontWeight: 700, marginTop: level <= 2 ? 20 : 12, marginBottom: 6, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', borderBottom: level <= 2 ? '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)' : undefined, paddingBottom: level <= 2 ? 6 : undefined }}>
+                          {renderInline(headingMatch[2])}
+                        </div>
+                      );
+                      i++;
+                      continue;
+                    }
+
+                    // Table
+                    if (line.startsWith('|') && line.includes('|')) {
+                      const tableLines: string[] = [];
+                      while (i < lines.length && lines[i].startsWith('|')) {
+                        tableLines.push(lines[i]);
+                        i++;
+                      }
+                      // Parse: header, separator, rows
+                      const parseRow = (r: string) => r.split('|').slice(1, -1).map((c) => c.trim());
+                      const header = parseRow(tableLines[0]);
+                      const isSep = (r: string) => /^\|[\s:|-]+\|$/.test(r);
+                      const dataStart = tableLines.length > 1 && isSep(tableLines[1]) ? 2 : 1;
+                      const rows = tableLines.slice(dataStart).map(parseRow);
+
+                      elements.push(
+                        <div key={elements.length} style={{ overflowX: 'auto', margin: '8px 0' }}>
+                          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                            <thead>
+                              <tr>
+                                {header.map((h, hi) => (
+                                  <th key={hi} style={{ textAlign: 'left', padding: '6px 10px', borderBottom: '2px solid var(--dt-colors-border-neutral-default, #ccc)', fontWeight: 700, fontSize: 11, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', whiteSpace: 'nowrap' }}>
+                                    {renderInline(h)}
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {rows.map((row, ri) => {
+                                const isTemplate = row.some((c) => /\*\([^)]+\)\*/.test(c));
+                                return (
+                                  <tr key={ri} style={{ background: isTemplate ? 'rgba(255,149,0,0.06)' : ri % 2 === 0 ? 'transparent' : 'rgba(0,0,0,0.02)' }}>
+                                    {row.map((cell, ci) => (
+                                      <td key={ci} style={{ padding: '5px 10px', borderBottom: '1px solid rgba(0,0,0,0.06)', fontSize: 12 }}>
+                                        {renderInline(cell)}
+                                      </td>
+                                    ))}
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      );
+                      continue;
+                    }
+
+                    // Horizontal rule
+                    if (/^---+$/.test(line.trim())) {
+                      elements.push(<hr key={elements.length} style={{ border: 'none', borderTop: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)', margin: '12px 0' }} />);
+                      i++;
+                      continue;
+                    }
+
+                    // Bullet list
+                    if (/^[\s]*[-*+]\s/.test(line)) {
+                      const items: string[] = [];
+                      while (i < lines.length && /^[\s]*[-*+]\s/.test(lines[i])) {
+                        items.push(lines[i].replace(/^[\s]*[-*+]\s/, ''));
+                        i++;
+                      }
+                      elements.push(
+                        <ul key={elements.length} style={{ margin: '6px 0', paddingLeft: 24 }}>
+                          {items.map((item, idx) => <li key={idx} style={{ marginBottom: 3 }}>{renderInline(item)}</li>)}
+                        </ul>
+                      );
+                      continue;
+                    }
+
+                    // Numbered list
+                    if (/^\s*\d+\.\s/.test(line)) {
+                      const items: string[] = [];
+                      while (i < lines.length && /^\s*\d+\.\s/.test(lines[i])) {
+                        items.push(lines[i].replace(/^\s*\d+\.\s/, ''));
+                        i++;
+                      }
+                      elements.push(
+                        <ol key={elements.length} style={{ margin: '6px 0', paddingLeft: 24 }}>
+                          {items.map((item, idx) => <li key={idx} style={{ marginBottom: 3 }}>{renderInline(item)}</li>)}
+                        </ol>
+                      );
+                      continue;
+                    }
+
+                    // Blank line
+                    if (!line.trim()) {
+                      elements.push(<div key={elements.length} style={{ height: 8 }} />);
+                      i++;
+                      continue;
+                    }
+
+                    // Normal paragraph
+                    elements.push(
+                      <div key={elements.length} style={{ marginBottom: 4 }}>
+                        {renderInline(line)}
+                      </div>
+                    );
+                    i++;
+                  }
+
+                  return elements;
+                })()}
+              </div>
+            </div>
+          </>
+        )}
       </Flex>
     );
   }
@@ -1055,7 +1645,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         <TitleBar>
           <TitleBar.Title>Your Own Query</TitleBar.Title>
           <TitleBar.Subtitle>
-            {connected ? <span style={{ color: '#00a86b' }}>Connected — {connectionInfo}</span> : <span style={{ color: '#999' }}>Not connected</span>}
+            {connected
+              ? <span style={{ color: '#00a86b' }}>✓ Connected — {connectionInfo}</span>
+              : !loadConfig().serverUrl
+                ? <span style={{ color: '#c41a16', fontWeight: 600 }}>⚠ MCP Server not configured — open Settings to connect</span>
+                : <span style={{ color: '#b35900' }}>⚠ Not connected to MCP Server</span>}
           </TitleBar.Subtitle>
           <TitleBar.Action>
             <button onClick={() => setViewMode('explorer')} style={{ ...modeBtnStyle, background: '#6950a1' }}>
@@ -1083,8 +1677,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         </div>
 
         <div style={{ padding: '12px 16px', borderTop: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)', display: 'flex', gap: 8, alignItems: 'flex-end' }}>
-          {kbLoaded && (
-            <span title="Knowledge base loaded in this session" style={{ fontSize: 18, padding: '6px 4px', opacity: 0.6 }}>✅</span>
+          {getDocumentFileRefs().length > 0 && (
+            <span title="Knowledge base documents attached via file references" style={{ fontSize: 18, padding: '6px 4px', opacity: 0.6 }}>📎</span>
           )}
           <textarea
             value={input}
@@ -1113,7 +1707,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       <TitleBar>
         <TitleBar.Title>MCP Query Explorer</TitleBar.Title>
         <TitleBar.Subtitle>
-          {connected ? <span style={{ color: '#00a86b' }}>Connected — {connectionInfo}</span> : <span style={{ color: '#999' }}>Not connected</span>}
+          {connected
+            ? <span style={{ color: '#00a86b' }}>✓ Connected — {connectionInfo}</span>
+            : !loadConfig().serverUrl
+              ? <span style={{ color: '#c41a16', fontWeight: 600 }}>⚠ MCP Server not configured — open Settings to connect</span>
+              : <span style={{ color: '#b35900' }}>⚠ Not connected to MCP Server</span>}
         </TitleBar.Subtitle>
         <TitleBar.Action>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -1132,14 +1730,15 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
 
       {/* Setup banner */}
       {!connected && !loading && !loadConfig().serverUrl && (
-        <div style={bannerStyle}>
+        <div style={{ ...bannerStyle, background: 'linear-gradient(135deg, rgba(196,26,22,0.06) 0%, rgba(179,89,0,0.06) 100%)', border: '1px solid rgba(196,26,22,0.3)' }}>
+          <div style={{ fontSize: 32, lineHeight: 1 }}>⚙️</div>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 4 }}>
-              Configure your MCP server to get started
+            <div style={{ fontSize: 15, fontWeight: 700, color: '#c41a16', marginBottom: 4 }}>
+              MCP Server not configured
             </div>
-            <div style={{ fontSize: 13, color: '#666' }}>Click the ⚙ cog in the top-right to add your remote MCP server URL.</div>
+            <div style={{ fontSize: 13, color: '#666' }}>You need to configure an MCP server URL and API key in Settings before you can use AI features like chat, recommendations, and discovery.</div>
           </div>
-          <button onClick={onOpenSettings} style={{ ...actionBtnStyle, background: '#1496ff' }}>Open Settings</button>
+          <button onClick={onOpenSettings} style={{ ...actionBtnStyle, background: '#c41a16' }}>⚙ Open Settings</button>
         </div>
       )}
 
@@ -1165,6 +1764,28 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           ))}
         </div>
       </div>
+
+      {/* Natural language query bar */}
+      {connected && (
+        <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)', display: 'flex', gap: 8, alignItems: 'center', background: 'var(--dt-colors-background-surface-default, #f8f8fb)' }}>
+          <span style={{ fontSize: 16 }}>🔮</span>
+          <input
+            value={nlQuery}
+            onChange={(e) => setNlQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleNaturalLanguageQuery(); } }}
+            placeholder="Ask in plain English… e.g. &quot;Show me all failed services in the last hour&quot;"
+            disabled={nlGenerating || loading}
+            style={{ flex: 1, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--dt-colors-border-neutral-default, #d0d0d0)', fontSize: 13, outline: 'none', background: 'white', fontFamily: 'inherit' }}
+          />
+          <button
+            onClick={handleNaturalLanguageQuery}
+            disabled={!nlQuery.trim() || nlGenerating || loading}
+            style={{ ...actionBtnStyle, background: !nlQuery.trim() || nlGenerating || loading ? '#ccc' : '#6950a1', cursor: !nlQuery.trim() || nlGenerating || loading ? 'not-allowed' : 'pointer', fontSize: 12, padding: '8px 16px' }}
+          >
+            {nlGenerating ? '⏳ Generating...' : '⚡ Run'}
+          </button>
+        </div>
+      )}
 
       {/* Bottom: Output + Recommendations side by side */}
       <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', minHeight: 0 }}>
@@ -1235,7 +1856,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             {recoLoading && (
               <div style={{ textAlign: 'center', marginTop: 30, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
                 <TypingDots />
-                <div style={{ fontSize: 12, color: '#6950a1', fontWeight: 500 }}>Analysing results and gathering context...</div>
+                <div style={{ fontSize: 12, color: '#6950a1', fontWeight: 500 }}>🧠 Claude is analysing results... <ElapsedTimer /></div>
+                <div style={{ fontSize: 11, color: '#999', maxWidth: 280, lineHeight: 1.5 }}>Claude will analyse the results and use Dynatrace MCP tools for additional context.</div>
               </div>
             )}
             {recommendation && (
@@ -1340,6 +1962,17 @@ function TypingDots() {
       ))}
     </div>
   );
+}
+
+function ElapsedTimer() {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setSeconds((s) => s + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return <span style={{ fontVariantNumeric: 'tabular-nums' }}>{mins > 0 ? `${mins}m ${secs}s` : `${secs}s`}</span>;
 }
 
 /* ─── Styles ─── */

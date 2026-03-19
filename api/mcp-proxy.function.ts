@@ -10,10 +10,8 @@
  */
 
 interface ProxyPayload {
-  /** The remote MCP server base URL, e.g. "https://dtroi.whydevslovedynatrace.com" */
-  serverUrl: string;
-  /** The path to call on the remote server, e.g. "/mcp/test-connection" */
-  path: string;
+  /** The full URL to call, e.g. "https://dtroi.whydevslovedynatrace.com/mcp/chat" */
+  url: string;
   /** HTTP method */
   method?: 'GET' | 'POST';
   /** Optional request body (for POST) */
@@ -23,19 +21,16 @@ interface ProxyPayload {
 }
 
 export default async function (payload: ProxyPayload) {
-  const { serverUrl, path, method = 'GET', body, apiKey } = payload;
+  const { url, method = 'GET', body, apiKey } = payload;
 
-  if (!serverUrl || !path) {
-    return { error: 'serverUrl and path are required' };
+  if (!url) {
+    return { error: 'url is required' };
   }
 
-  // Validate the path starts with /mcp/ or /health to prevent open proxy
-  const allowedPrefixes = ['/mcp/', '/health'];
-  if (!allowedPrefixes.some((p) => path === p || path.startsWith(p))) {
-    return { error: 'Only /mcp/* and /health paths are allowed' };
+  // Only allow HTTPS URLs to prevent SSRF to internal services
+  if (!url.startsWith('https://')) {
+    return { error: 'Only HTTPS URLs are allowed' };
   }
-
-  const url = `${serverUrl.replace(/\/+$/, '')}${path}`;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -52,7 +47,22 @@ export default async function (payload: ProxyPayload) {
     fetchOptions.body = JSON.stringify(body);
   }
 
-  const res = await fetch(url, fetchOptions);
+  // 55-second timeout — fail before nginx 504 (usually 60s)
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 55000);
+  fetchOptions.signal = controller.signal;
+
+  let res: Response;
+  try {
+    res = await fetch(url, fetchOptions);
+  } catch (err: unknown) {
+    clearTimeout(timeout);
+    if (err instanceof Error && err.name === 'AbortError') {
+      return { status: 504, ok: false, data: 'Request timed out after 55 seconds' };
+    }
+    throw err;
+  }
+  clearTimeout(timeout);
   const responseBody = await res.text();
 
   let parsed: unknown;

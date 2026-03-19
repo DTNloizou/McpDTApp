@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "dynatrace-mcp-server": {
+      "command": "mcp-server-dynatrace",
+      "args": [],
+      "envFile": "${workspaceFolder}/.vscode/.env"
+    }
+  }
+}

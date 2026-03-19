@@ -1,7 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { loadConfig, saveConfig, AGENT_OPTIONS, type McpConfig, type AgentType } from '../config';
 import { testConnection, listTools, type McpTool } from '../mcp-client';
-import { getKBDocuments, addKBDocument, removeKBDocument, loadKBDocuments, type KBDocument } from '../knowledge-base';
+import {
+  getKBDocuments, addKBDocument, removeKBDocument, loadKBDocuments,
+  deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus,
+  type KBDocument, type FileSyncStatus,
+} from '../knowledge-base';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -19,6 +23,8 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   const [tools, setTools] = useState<McpTool[]>([]);
   const [saved, setSaved] = useState(false);
   const [kbDocs, setKbDocs] = useState<KBDocument[]>([]);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMessage, setSyncMessage] = useState('');
 
   useEffect(() => {
     if (open) {
@@ -28,6 +34,7 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
       setAgentType(config.agent.type);
       setAgentApiKey(config.agent.apiKey);
       setSaved(false);
+      setSyncMessage('');
       loadKBDocuments().then((docs) => setKbDocs(docs));
     }
   }, [open]);
@@ -149,10 +156,10 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
               type="text"
               value={serverUrl}
               onChange={(e) => setServerUrl(e.target.value)}
-              placeholder="https://dtroi.whydevslovedynatrace.com"
+              placeholder="https://dtroi.whydevslovedynatrace.com/mcp"
               style={inputStyle}
             />
-            <FieldHint>Base URL of your remote MCP server</FieldHint>
+            <FieldHint>Full base URL of your MCP server (e.g. https://example.com/mcp)</FieldHint>
           </FieldGroup>
 
           <FieldGroup label="Bearer Token">
@@ -245,7 +252,7 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
             Upload .md files as reference context. The AI will use these documents when generating recommendations and answering queries.
           </FieldHint>
 
-          <div style={{ marginTop: 10, marginBottom: 12 }}>
+          <div style={{ marginTop: 10, marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
             <label
               style={{
                 display: 'inline-flex',
@@ -282,7 +289,50 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
                 }}
               />
             </label>
+            {kbDocs.length > 0 && agentApiKey.trim() && (
+              <button
+                onClick={async () => {
+                  setSyncing(true);
+                  setSyncMessage('Syncing files to Anthropic...');
+                  try {
+                    const results = await syncAllDocsToAnthropic(agentApiKey);
+                    const uploaded = results.filter((r) => r.status === 'uploaded').length;
+                    const errors = results.filter((r) => r.status === 'error').length;
+                    const already = results.filter((r) => r.status === 'synced').length;
+                    const parts: string[] = [];
+                    if (uploaded) parts.push(`${uploaded} uploaded`);
+                    if (already) parts.push(`${already} already synced`);
+                    if (errors) parts.push(`${errors} failed`);
+                    setSyncMessage(`✓ ${parts.join(', ')}`);
+                    setKbDocs(getKBDocuments());
+                  } catch (err: unknown) {
+                    setSyncMessage(`✕ ${err instanceof Error ? err.message : 'Sync failed'}`);
+                  } finally {
+                    setSyncing(false);
+                  }
+                }}
+                disabled={syncing}
+                style={{
+                  ...btnSecondaryStyle(syncing),
+                  fontSize: 12,
+                  padding: '7px 12px',
+                }}
+                title="Upload documents to Anthropic Files API for efficient referencing"
+              >
+                {syncing ? '↻ Syncing...' : '☁ Sync to Claude'}
+              </button>
+            )}
           </div>
+
+          {syncMessage && (
+            <div style={{
+              fontSize: 12,
+              color: syncMessage.startsWith('✓') ? '#00a86b' : syncMessage.startsWith('✕') ? '#c62828' : '#666',
+              marginBottom: 8,
+            }}>
+              {syncMessage}
+            </div>
+          )}
 
           {kbDocs.length === 0 && (
             <div style={{ fontSize: 12, color: '#999', fontStyle: 'italic', marginBottom: 12 }}>
@@ -292,7 +342,9 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
 
           {kbDocs.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
-              {kbDocs.map((doc) => (
+              {kbDocs.map((doc) => {
+                const syncStatus = getDocSyncStatus(doc.name);
+                return (
                 <div
                   key={doc.name}
                   style={{
@@ -306,13 +358,28 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
                     fontSize: 12,
                   }}
                 >
-                  <span>📄</span>
+                  <span title={syncStatus === 'synced' ? 'Synced to Anthropic' : syncStatus === 'modified' ? 'Modified since last sync' : 'Not yet synced'}>
+                    {syncStatus === 'synced' ? '☁️' : syncStatus === 'modified' ? '🔄' : '📄'}
+                  </span>
                   <span style={{ flex: 1, fontWeight: 500, color: 'var(--dt-colors-text-primary-default, #2c2d4d)' }}>{doc.name}</span>
                   <span style={{ color: '#999', fontSize: 11 }}>
                     {(doc.content.length / 1024).toFixed(1)}KB
                   </span>
+                  {syncStatus === 'synced' && (
+                    <span style={{ color: '#00a86b', fontSize: 10, fontWeight: 600 }}>SYNCED</span>
+                  )}
+                  {syncStatus === 'modified' && (
+                    <span style={{ color: '#b36305', fontSize: 10, fontWeight: 600 }}>MODIFIED</span>
+                  )}
                   <button
-                    onClick={async () => { await removeKBDocument(doc.name); setKbDocs(getKBDocuments()); }}
+                    onClick={async () => {
+                      // Delete from Anthropic if synced
+                      if (doc.fileId && agentApiKey.trim()) {
+                        try { await deleteDocFromAnthropic(doc.name, agentApiKey); } catch { /* best-effort */ }
+                      }
+                      await removeKBDocument(doc.name);
+                      setKbDocs(getKBDocuments());
+                    }}
                     title="Remove document"
                     style={{
                       background: 'none',
@@ -326,7 +393,8 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
                     ✕
                   </button>
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
