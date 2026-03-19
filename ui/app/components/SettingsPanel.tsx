@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { loadConfig, saveConfig, AGENT_OPTIONS, type McpConfig, type AgentType } from '../config';
-import { testConnection, listTools, type McpTool } from '../mcp-client';
+import { loadConfig, saveConfig, AGENT_OPTIONS, AI_MODE_OPTIONS, type McpConfig, type AgentType, type AIMode } from '../config';
+import { testConnection, testDavisConnection, listTools, type McpTool } from '../mcp-client';
 import {
   getKBDocuments, addKBDocument, removeKBDocument, loadKBDocuments,
   deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus,
@@ -14,10 +14,13 @@ interface SettingsPanelProps {
 }
 
 export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelProps) => {
+  const [aiMode, setAiMode] = useState<AIMode>('dynatrace-assist');
   const [serverUrl, setServerUrl] = useState('');
   const [bearerToken, setBearerToken] = useState('');
   const [agentType, setAgentType] = useState<AgentType>('claude');
   const [agentApiKey, setAgentApiKey] = useState('');
+  const [claudeEnabled, setClaudeEnabled] = useState(false);
+  const [claudeApiKey, setClaudeApiKey] = useState('');
   const [status, setStatus] = useState<'idle' | 'testing' | 'connected' | 'error'>('idle');
   const [statusMessage, setStatusMessage] = useState('');
   const [tools, setTools] = useState<McpTool[]>([]);
@@ -29,11 +32,16 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   useEffect(() => {
     if (open) {
       const config = loadConfig();
+      setAiMode(config.aiMode);
       setServerUrl(config.serverUrl);
       setBearerToken(config.apiKey);
       setAgentType(config.agent.type);
       setAgentApiKey(config.agent.apiKey);
+      setClaudeEnabled(config.claudeEnabled);
+      setClaudeApiKey(config.claudeApiKey);
       setSaved(false);
+      setStatus('idle');
+      setStatusMessage('');
       setSyncMessage('');
       loadKBDocuments().then((docs) => setKbDocs(docs));
     }
@@ -42,9 +50,12 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   if (!open) return null;
 
   const buildConfig = (): McpConfig => ({
+    aiMode,
     serverUrl: serverUrl.replace(/\/+$/, ''),
     apiKey: bearerToken,
     agent: { type: agentType, apiKey: agentApiKey },
+    claudeEnabled,
+    claudeApiKey,
   });
 
   const handleSave = () => {
@@ -55,6 +66,26 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   };
 
   const handleTest = async () => {
+    if (aiMode === 'dynatrace-assist') {
+      setStatus('testing');
+      setStatusMessage('Testing Davis CoPilot connection...');
+      setTools([]);
+      try {
+        const result = await testDavisConnection();
+        if (result.status === 'success') {
+          setStatus('connected');
+          setStatusMessage(`Connected to ${result.environment || 'Dynatrace Assist'}`);
+        } else {
+          setStatus('error');
+          setStatusMessage(`Failed: ${result.message}`);
+        }
+      } catch (err: unknown) {
+        setStatus('error');
+        setStatusMessage(`Error: ${err instanceof Error ? err.message : 'Unknown'}`);
+      }
+      return;
+    }
+
     if (!serverUrl.trim()) {
       setStatus('error');
       setStatusMessage('Please enter a Server URL first');
@@ -148,8 +179,80 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
 
         {/* Content */}
         <div style={{ flex: 1, overflowY: 'auto', padding: 20 }}>
-          {/* MCP Server Section */}
-          <SectionHeader title="Remote MCP Server" />
+          {/* AI Provider Mode Selection */}
+          <SectionHeader title="AI Provider" />
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 20 }}>
+            {AI_MODE_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                onClick={() => { setAiMode(opt.value); setStatus('idle'); setStatusMessage(''); setTools([]); }}
+                style={{
+                  padding: '14px 16px',
+                  borderRadius: 10,
+                  border: `2px solid ${aiMode === opt.value ? (opt.value === 'dynatrace-assist' ? '#00a86b' : '#1496ff') : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
+                  background: aiMode === opt.value
+                    ? (opt.value === 'dynatrace-assist' ? 'rgba(0,168,107,0.06)' : 'rgba(20,150,255,0.06)')
+                    : 'var(--dt-colors-background-surface-default, #f8f8fb)',
+                  cursor: 'pointer',
+                  textAlign: 'left',
+                  transition: 'all 0.15s',
+                }}
+              >
+                <div style={{ fontSize: 22, marginBottom: 6 }}>{opt.emoji}</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
+                  {opt.label}
+                </div>
+                <div style={{ fontSize: 11, color: '#999', lineHeight: 1.4 }}>
+                  {opt.description}
+                </div>
+                {aiMode === opt.value && (
+                  <div style={{ marginTop: 6, fontSize: 11, fontWeight: 600, color: opt.value === 'dynatrace-assist' ? '#00a86b' : '#1496ff' }}>
+                    ✓ Selected
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Dynatrace Assist mode — minimal config */}
+          {aiMode === 'dynatrace-assist' && (
+            <>
+              <div style={{
+                padding: '16px 20px',
+                borderRadius: 10,
+                background: 'linear-gradient(135deg, rgba(0,168,107,0.08) 0%, rgba(0,152,212,0.08) 100%)',
+                border: '1px solid rgba(0,168,107,0.25)',
+                marginBottom: 16,
+              }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 4 }}>
+                  🤖 Ready to use
+                </div>
+                <div style={{ fontSize: 12, color: '#666', lineHeight: 1.5 }}>
+                  Dynatrace Assist uses the built-in Davis CoPilot — no external servers or API keys needed.
+                  AI features like natural language queries, recommendations, and chat are powered directly by your Dynatrace platform.
+                </div>
+              </div>
+
+              {/* Connection test */}
+              <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                <button onClick={handleTest} style={btnSecondaryStyle(false)}>
+                  {status === 'testing' ? 'Testing...' : 'Test Davis CoPilot'}
+                </button>
+              </div>
+
+              {statusMessage && (
+                <StatusBanner status={status} message={statusMessage} />
+              )}
+            </>
+          )}
+
+          {/* External MCP mode — full config */}
+          {aiMode === 'external-mcp' && (
+            <>
+              <Divider />
+
+              {/* MCP Server Section */}
+              <SectionHeader title="Remote MCP Server" />
 
           <FieldGroup label="Server URL">
             <input
@@ -397,6 +500,71 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
               })}
             </div>
           )}
+            </>
+          )}
+
+          <Divider />
+
+          {/* Claude Integration — separate from AI Provider */}
+          <SectionHeader title="Claude Integration" />
+          <div style={{
+            padding: '14px 16px',
+            borderRadius: 10,
+            border: `2px solid ${claudeEnabled ? '#D97706' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
+            background: claudeEnabled ? 'rgba(217,119,6,0.06)' : 'var(--dt-colors-background-surface-default, #f8f8fb)',
+            marginBottom: 16,
+            transition: 'all 0.15s',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: claudeEnabled ? 12 : 0 }}>
+              <button
+                onClick={() => setClaudeEnabled(!claudeEnabled)}
+                style={{
+                  width: 40,
+                  height: 22,
+                  borderRadius: 11,
+                  border: 'none',
+                  background: claudeEnabled ? '#D97706' : '#ccc',
+                  cursor: 'pointer',
+                  position: 'relative',
+                  transition: 'background 0.2s',
+                  flexShrink: 0,
+                }}
+              >
+                <div style={{
+                  width: 18,
+                  height: 18,
+                  borderRadius: '50%',
+                  background: '#fff',
+                  position: 'absolute',
+                  top: 2,
+                  left: claudeEnabled ? 20 : 2,
+                  transition: 'left 0.2s',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                }} />
+              </button>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)' }}>
+                  🧠 Enable Claude
+                </div>
+                <div style={{ fontSize: 11, color: '#999', lineHeight: 1.4 }}>
+                  Adds "Ask Claude" option — uses Davis context + Claude for deeper analysis
+                </div>
+              </div>
+            </div>
+
+            {claudeEnabled && (
+              <FieldGroup label="Anthropic API Key">
+                <input
+                  type="password"
+                  value={claudeApiKey}
+                  onChange={(e) => setClaudeApiKey(e.target.value)}
+                  placeholder="sk-ant-..."
+                  style={inputStyle}
+                />
+                <FieldHint>Your Anthropic API key. Davis gathers context first, then Claude provides deeper analysis.</FieldHint>
+              </FieldGroup>
+            )}
+          </div>
         </div>
 
         {/* Footer */}

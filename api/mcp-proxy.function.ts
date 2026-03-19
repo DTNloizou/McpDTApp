@@ -48,21 +48,27 @@ export default async function (payload: ProxyPayload) {
   }
 
   // 55-second timeout — fail before nginx 504 (usually 60s)
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 55000);
-  fetchOptions.signal = controller.signal;
+  // AbortController may not exist in the Dynatrace JavaScript Runtime
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  if (typeof AbortController !== 'undefined') {
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), 55000);
+    fetchOptions.signal = controller.signal;
+  }
 
   let res: Response;
   try {
     res = await fetch(url, fetchOptions);
   } catch (err: unknown) {
-    clearTimeout(timeout);
+    if (timeout) clearTimeout(timeout);
     if (err instanceof Error && err.name === 'AbortError') {
       return { status: 504, ok: false, data: 'Request timed out after 55 seconds' };
     }
-    throw err;
+    // Return error details instead of throwing (which causes generic "function failed" in production)
+    return { status: 0, ok: false, data: `Fetch error: ${err instanceof Error ? err.message : String(err)}` };
   }
-  clearTimeout(timeout);
+  if (timeout) clearTimeout(timeout);
+
   const responseBody = await res.text();
 
   let parsed: unknown;

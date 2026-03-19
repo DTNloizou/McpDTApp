@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, forwardRef } from 'react';
 import { Flex } from '@dynatrace/strato-components/layouts';
 import { TitleBar } from '@dynatrace/strato-components-preview/layouts';
-import { sendChat, testConnection, executeDql, getRecommendations, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
+import { sendChat, testConnection, testDavisConnection, executeDql, getRecommendations, getClaudeRecommendations, createNotebook, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
 import { loadConfig } from '../config';
 import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
 import { loadCustomCategories, getCustomCategories, saveCustomCategories, type CustomCategory, type CustomQuery } from '../custom-queries';
@@ -202,6 +202,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   const [resolvingPlaceholders, setResolvingPlaceholders] = useState(false);
   const [viewingDoc, setViewingDoc] = useState<KBDocument | null>(null);
   const [notebookGenerating, setNotebookGenerating] = useState(false);
+  const [enrichingReco, setEnrichingReco] = useState(false);
   const [nlQuery, setNlQuery] = useState('');
   const [nlGenerating, setNlGenerating] = useState(false);
 
@@ -235,7 +236,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
 
   useEffect(() => {
     const config = loadConfig();
-    if (config.serverUrl) handleConnect();
+    if (config.aiMode === 'dynatrace-assist' || config.serverUrl) handleConnect();
     // Load persisted KB documents and placeholder values
     loadKBDocuments().then((docs) => {
       setKbDocs(docs);
@@ -252,6 +253,14 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
 
   const handleConnect = async (explicitUrl?: string, explicitKey?: string) => {
     const config = loadConfig();
+
+    // In Davis mode, always mark as connected (Davis CoPilot is built-in)
+    if (config.aiMode === 'dynatrace-assist') {
+      setConnected(true);
+      setConnectionInfo('Dynatrace Assist (Davis CoPilot)');
+      return;
+    }
+
     const serverUrl = explicitUrl || config.serverUrl;
     const apiKey = explicitKey ?? config.apiKey;
     if (!serverUrl) return;
@@ -269,9 +278,15 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
 
   const formatDqlResult = (resultText: string): string => {
     try {
+      // Try to extract JSON from markdown fences first, then fall back to raw JSON
+      let jsonStr: string;
       const jsonMatch = resultText.match(/```json\n([\s\S]*?)\n```/);
-      if (!jsonMatch) return resultText;
-      const data = JSON.parse(jsonMatch[1]);
+      if (jsonMatch) {
+        jsonStr = jsonMatch[1];
+      } else {
+        jsonStr = resultText.trim();
+      }
+      const data = JSON.parse(jsonStr);
       if (!Array.isArray(data) || data.length === 0) return resultText;
 
       const columns = Object.keys(data[0]);
@@ -387,64 +402,84 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     if (!lastQuery || !recommendation || recommendation.role !== 'assistant') return;
     setNotebookGenerating(true);
     try {
-      // Use KB summary to keep tokens low and avoid rate limits
-      const fileRefs = getDocumentFileRefs();
-      const kbSummary = fileRefs.length > 0 ? undefined : buildKBSummary(placeholderValues);
+      const config = loadConfig();
 
-      const prompt = [
-        `Create a Dynatrace Notebook using the create-notebook tool.`,
-        ``,
-        `**Notebook title:** ${lastQuery.label} — Analysis`,
-        ``,
-        `RULES:`,
-        `- Every DQL query MUST be an executable DQL code section (type "code", language "dql"), NOT markdown code blocks.`,
-        `- Do NOT validate or run any queries before creating the notebook — just create it directly in a single create-notebook call.`,
-        `- Do NOT call execute-dql. Only call create-notebook once with all sections.`,
-        `- Each DQL code section should have a markdown section above it explaining what it investigates.`,
-        `- Entity types in DQL are lowercase: dt.entity.service, dt.entity.host, etc.`,
-        `- Valid entity fields: entity.name, id, entity.detected_name, lifetime, tags, managementZones.`,
-        ``,
-        `NOTEBOOK SECTIONS:`,
-        ``,
-        `1. Markdown: Title "${lastQuery.label}" with brief context`,
-        ``,
-        `2. DQL code section — the original query:`,
-        lastQuery.dql,
-        ``,
-        `3. Markdown: "Root Cause Analysis" — followed by 2-3 DQL code sections that:`,
-        `   - Break down errors/issues by time period (hourly bins)`,
-        `   - Correlate with related services or dependencies`,
-        `   - Analyse by key dimensions (customer, region, type)`,
-        ``,
-        `4. Markdown: "Impact Assessment" — followed by 1-2 DQL code sections for:`,
-        `   - Quantifying affected transactions/users`,
-        `   - Comparison with baseline periods`,
-        ``,
-        `5. Markdown: "Recommendations" containing:`,
-        recommendation.content.slice(0, 3000),
-        ``,
-        ...(kbSummary ? [
-          `Context from reference docs: ${kbSummary}`,
-          `Reference architecture components, SLAs, and entity names from docs where relevant.`,
-        ] : []),
-      ].join('\n');
+      if (config.aiMode === 'dynatrace-assist') {
+        // Build notebook directly using the Document SDK
+        const recoText = recommendation.content.slice(0, 3000);
+        const sections: { type: 'markdown' | 'dql'; content: string }[] = [
+          { type: 'markdown', content: `# ${lastQuery.label}\n\nGenerated from the Query Explorer with AI recommendations.` },
+          { type: 'markdown', content: `## Original Query` },
+          { type: 'dql', content: lastQuery.dql },
+          { type: 'markdown', content: `## Recommendations\n\n${recoText}` },
+        ];
 
-      const result = await sendChat(prompt, [], undefined, fileRefs.length > 0 ? fileRefs : undefined);
-
-      if (result.status === 'success') {
-        // Check if the response contains a notebook URL or ID
-        // NOTE: Notebook generation still uses remote MCP server (sendChat) because it needs the create-notebook tool
-        const urlMatch = result.response?.match(/notebook\/([a-zA-Z0-9-]+)/);
-        if (urlMatch) {
-          window.open(`/ui/apps/dynatrace.notebooks/notebook/${urlMatch[1]}`, '_blank');
+        const result = await createNotebook(`${lastQuery.label} — Analysis`, sections);
+        if (result.status === 'success' && result.notebookId) {
+          setRecommendation({
+            role: 'assistant',
+            content: `**Notebook created successfully.**\n\n[Open Notebook →](/ui/apps/dynatrace.notebooks/notebook/${result.notebookId})\n\n${recoText}`,
+          });
+        } else {
+          setRecommendation({ role: 'error', content: `Failed to create notebook: ${result.message}` });
         }
-        setRecommendation({ role: 'assistant', content: result.response || 'Notebook created successfully.' });
-        // Auto-save notebook findings to KB
-        const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
-        const entry = `## Notebook: ${lastQuery.label} — ${timestamp}\n\nNotebook generated with root-cause analysis and impact assessment.\n\n${recommendation.content.slice(0, 1500)}`;
-        appendToKBDocument('discovered-findings.md', entry).catch(() => {/* best-effort */});
       } else {
-        setRecommendation({ role: 'error', content: `Failed to create notebook: ${result.message}` });
+        // External MCP mode — ask Claude to use the create-notebook tool
+        const fileRefs = getDocumentFileRefs();
+        const kbSummary = fileRefs.length > 0 ? undefined : buildKBSummary(placeholderValues);
+
+        const prompt = [
+          `Create a Dynatrace Notebook using the create-notebook tool.`,
+          ``,
+          `**Notebook title:** ${lastQuery.label} — Analysis`,
+          ``,
+          `RULES:`,
+          `- Every DQL query MUST be an executable DQL code section (type "code", language "dql"), NOT markdown code blocks.`,
+          `- Do NOT validate or run any queries before creating the notebook — just create it directly in a single create-notebook call.`,
+          `- Do NOT call execute-dql. Only call create-notebook once with all sections.`,
+          `- Each DQL code section should have a markdown section above it explaining what it investigates.`,
+          `- Entity types in DQL are lowercase: dt.entity.service, dt.entity.host, etc.`,
+          `- Valid entity fields: entity.name, id, entity.detected_name, lifetime, tags, managementZones.`,
+          ``,
+          `NOTEBOOK SECTIONS:`,
+          ``,
+          `1. Markdown: Title "${lastQuery.label}" with brief context`,
+          ``,
+          `2. DQL code section — the original query:`,
+          lastQuery.dql,
+          ``,
+          `3. Markdown: "Root Cause Analysis" — followed by 2-3 DQL code sections that:`,
+          `   - Break down errors/issues by time period (hourly bins)`,
+          `   - Correlate with related services or dependencies`,
+          `   - Analyse by key dimensions (customer, region, type)`,
+          ``,
+          `4. Markdown: "Impact Assessment" — followed by 1-2 DQL code sections for:`,
+          `   - Quantifying affected transactions/users`,
+          `   - Comparison with baseline periods`,
+          ``,
+          `5. Markdown: "Recommendations" containing:`,
+          recommendation.content.slice(0, 3000),
+          ``,
+          ...(kbSummary ? [
+            `Context from reference docs: ${kbSummary}`,
+            `Reference architecture components, SLAs, and entity names from docs where relevant.`,
+          ] : []),
+        ].join('\n');
+
+        const result = await sendChat(prompt, [], undefined, fileRefs.length > 0 ? fileRefs : undefined);
+
+        if (result.status === 'success') {
+          const urlMatch = result.response?.match(/notebook\/([a-zA-Z0-9-]+)/);
+          if (urlMatch) {
+            window.open(`/ui/apps/dynatrace.notebooks/notebook/${urlMatch[1]}`, '_blank');
+          }
+          setRecommendation({ role: 'assistant', content: result.response || 'Notebook created successfully.' });
+          const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+          const entry = `## Notebook: ${lastQuery.label} — ${timestamp}\n\nNotebook generated with root-cause analysis and impact assessment.\n\n${recommendation.content.slice(0, 1500)}`;
+          appendToKBDocument('discovered-findings.md', entry).catch(() => {/* best-effort */});
+        } else {
+          setRecommendation({ role: 'error', content: `Failed to create notebook: ${result.message}` });
+        }
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -452,6 +487,96 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     } finally {
       setNotebookGenerating(false);
     }
+  };
+
+  const enrichRecommendationContent = async (text: string): Promise<string> => {
+    const blocks: { fullMatch: string; dql: string; index: number }[] = [];
+
+    // 1. Fenced code blocks: ```dql, ```sql, or plain ```
+    const fencedRegex = /```(?:dql|sql|)[ \t]*\n([\s\S]*?)```/g;
+    let m: RegExpExecArray | null;
+    while ((m = fencedRegex.exec(text)) !== null) {
+      const dql = m[1].trim();
+      if (dql.startsWith('fetch ') || dql.startsWith('timeseries ')) {
+        blocks.push({ fullMatch: m[0], dql, index: m.index });
+      }
+    }
+
+    // 2. Parenthesised DQL: (fetch ... | ...) or (timeseries ... | ...)
+    const parenRegex = /\(\s*((?:fetch |timeseries )[^)]+)\)/g;
+    while ((m = parenRegex.exec(text)) !== null) {
+      const dql = m[1].trim();
+      const insideFenced = blocks.some((b) => m!.index >= b.index && m!.index < b.index + b.fullMatch.length);
+      if (insideFenced) continue;
+      if (dql.includes(' | ')) {
+        blocks.push({ fullMatch: m[0], dql, index: m.index });
+      }
+    }
+
+    // 3. Bare inline DQL: "fetch ... | ..." not in parens or code blocks
+    const inlineRegex = /(?<![(\w])((?:fetch |timeseries )[^\n]*\|[^\n]*)/g;
+    while ((m = inlineRegex.exec(text)) !== null) {
+      const dql = m[1].trim();
+      const insideExisting = blocks.some((b) => m!.index >= b.index && m!.index < b.index + b.fullMatch.length);
+      if (insideExisting) continue;
+      if (!/\|\s*(?:filter|summarize|fields|sort|limit|lookup|join|parse|append|compare|group|fieldsAdd|fieldsRemove|timeseries|makeTimeseries|countIf)/.test(dql)) continue;
+      blocks.push({ fullMatch: m[0], dql, index: m.index });
+    }
+
+    if (blocks.length === 0) return text;
+
+    // Sort by index and deduplicate overlaps
+    blocks.sort((a, b) => a.index - b.index);
+    const deduped: typeof blocks = [];
+    for (const b of blocks) {
+      const prev = deduped[deduped.length - 1];
+      if (prev && b.index < prev.index + prev.fullMatch.length) continue;
+      deduped.push(b);
+    }
+
+    // Process in reverse order so string indices stay valid
+    let enriched = text;
+    for (let i = deduped.length - 1; i >= 0; i--) {
+      const { fullMatch, dql, index } = deduped[i];
+      let insertText = '';
+      try {
+        const result = await executeDql(dql, 50);
+        const raw = result.result?.content?.[0]?.text || '';
+        if (result.status === 'success' && raw && raw.length > 5) {
+          let tableOutput = '';
+          try {
+            const records = JSON.parse(raw) as Record<string, unknown>[];
+            if (Array.isArray(records) && records.length > 0) {
+              const keys = Object.keys(records[0]);
+              const header = '| ' + keys.join(' | ') + ' |';
+              const sep = '| ' + keys.map(() => '---').join(' | ') + ' |';
+              const rows = records.slice(0, 30).map((r) =>
+                '| ' + keys.map((k) => {
+                  const v = r[k];
+                  return v === null || v === undefined ? '' : String(v);
+                }).join(' | ') + ' |'
+              );
+              tableOutput = [header, sep, ...rows].join('\n');
+              if (records.length > 30) tableOutput += `\n\n*(showing 30 of ${records.length} records)*`;
+            } else {
+              tableOutput = raw;
+            }
+          } catch {
+            tableOutput = raw.length > 2000 ? raw.slice(0, 2000) + '\n...(truncated)' : raw;
+          }
+          insertText = `\n\n**Query Results** (${result.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}`;
+        } else {
+          const errMsg = result.message || 'No data returned';
+          insertText = `\n\n*Query returned no data: ${errMsg}*`;
+        }
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : 'Query failed';
+        insertText = `\n\n*Query error: ${errMsg}*`;
+      }
+      const endPos = index + fullMatch.length;
+      enriched = enriched.slice(0, endPos) + insertText + enriched.slice(endPos);
+    }
+    return enriched;
   };
 
   const handleGetRecommendations = async () => {
@@ -464,13 +589,49 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       const kbSummary = fileRefs.length > 0 ? undefined : buildKBSummary(placeholderValues);
       const result: ChatResponse = await getRecommendations(lastQuery.label, lastQuery.dql, lastQuery.results, kbSummary || undefined, undefined, fileRefs.length > 0 ? fileRefs : undefined);
       if (result.status === 'success') {
+        // Show initial recommendations immediately
         setRecommendation({ role: 'assistant', content: result.response, toolCalls: result.toolCalls });
+        // Auto-run any DQL queries found in the recommendations
+        setEnrichingReco(true);
+        try {
+          const enriched = await enrichRecommendationContent(result.response);
+          setRecommendation({ role: 'assistant', content: enriched, toolCalls: result.toolCalls });
+        } finally {
+          setEnrichingReco(false);
+        }
         // Auto-save findings to KB so the AI remembers them in future sessions
         const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
         const entry = `## ${lastQuery.label} — ${timestamp}\n\n**Query:** \`${lastQuery.dql.slice(0, 200)}\`\n\n${result.response.slice(0, 2000)}`;
         appendToKBDocument('discovered-findings.md', entry).catch(() => {/* best-effort */});
       } else {
         setRecommendation({ role: 'error', content: `Recommendations failed: ${result.message}` });
+      }
+    } catch (err: unknown) {
+      setRecommendation({ role: 'error', content: `Error: ${err instanceof Error ? err.message : 'Unknown'}` });
+    } finally { setRecoLoading(false); }
+  };
+
+  const handleAskClaude = async () => {
+    if (!lastQuery || recoLoading) return;
+    setRecoLoading(true);
+    setRecommendation(null);
+    try {
+      const kbSummary = buildKBSummary(placeholderValues);
+      const result: ChatResponse = await getClaudeRecommendations(lastQuery.label, lastQuery.dql, lastQuery.results, kbSummary || undefined);
+      if (result.status === 'success') {
+        setRecommendation({ role: 'assistant', content: result.response, toolCalls: result.toolCalls });
+        setEnrichingReco(true);
+        try {
+          const enriched = await enrichRecommendationContent(result.response);
+          setRecommendation({ role: 'assistant', content: enriched, toolCalls: result.toolCalls });
+        } finally {
+          setEnrichingReco(false);
+        }
+        const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+        const entry = `## ${lastQuery.label} (Claude) — ${timestamp}\n\n**Query:** \`${lastQuery.dql.slice(0, 200)}\`\n\n${result.response.slice(0, 2000)}`;
+        appendToKBDocument('discovered-findings.md', entry).catch(() => {});
+      } else {
+        setRecommendation({ role: 'error', content: `Claude analysis failed: ${result.message}` });
       }
     } catch (err: unknown) {
       setRecommendation({ role: 'error', content: `Error: ${err instanceof Error ? err.message : 'Unknown'}` });
@@ -1647,9 +1808,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           <TitleBar.Subtitle>
             {connected
               ? <span style={{ color: '#00a86b' }}>✓ Connected — {connectionInfo}</span>
-              : !loadConfig().serverUrl
-                ? <span style={{ color: '#c41a16', fontWeight: 600 }}>⚠ MCP Server not configured — open Settings to connect</span>
-                : <span style={{ color: '#b35900' }}>⚠ Not connected to MCP Server</span>}
+              : loadConfig().aiMode === 'dynatrace-assist'
+                ? <span style={{ color: '#b35900' }}>⚠ Connecting to Dynatrace Assist...</span>
+                : !loadConfig().serverUrl
+                  ? <span style={{ color: '#c41a16', fontWeight: 600 }}>⚠ MCP Server not configured — open Settings to connect</span>
+                  : <span style={{ color: '#b35900' }}>⚠ Not connected to MCP Server</span>}
           </TitleBar.Subtitle>
           <TitleBar.Action>
             <button onClick={() => setViewMode('explorer')} style={{ ...modeBtnStyle, background: '#6950a1' }}>
@@ -1661,7 +1824,10 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
           {messages.length === 0 && !loading && (
             <div style={{ textAlign: 'center', color: '#999', marginTop: 60, fontSize: 14 }}>
-              Ask anything about your Dynatrace environment.<br />The AI assistant will use MCP tools to query data and provide insights.
+              Ask anything about your Dynatrace environment.<br />
+              {loadConfig().aiMode === 'dynatrace-assist'
+                ? 'Davis CoPilot will analyse your data and provide insights.'
+                : 'The AI assistant will use MCP tools to query data and provide insights.'}
             </div>
           )}
           {messages.map((msg, i) => (
@@ -1705,13 +1871,15 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   return (
     <Flex width="100%" flexDirection="column" gap={0} style={{ height: '100%' }}>
       <TitleBar>
-        <TitleBar.Title>MCP Query Explorer</TitleBar.Title>
+        <TitleBar.Title>{loadConfig().aiMode === 'dynatrace-assist' ? 'Query Explorer' : 'MCP Query Explorer'}</TitleBar.Title>
         <TitleBar.Subtitle>
           {connected
             ? <span style={{ color: '#00a86b' }}>✓ Connected — {connectionInfo}</span>
-            : !loadConfig().serverUrl
-              ? <span style={{ color: '#c41a16', fontWeight: 600 }}>⚠ MCP Server not configured — open Settings to connect</span>
-              : <span style={{ color: '#b35900' }}>⚠ Not connected to MCP Server</span>}
+            : loadConfig().aiMode === 'dynatrace-assist'
+              ? <span style={{ color: '#b35900' }}>⚠ Connecting to Dynatrace Assist...</span>
+              : !loadConfig().serverUrl
+                ? <span style={{ color: '#c41a16', fontWeight: 600 }}>⚠ MCP Server not configured — open Settings to connect</span>
+                : <span style={{ color: '#b35900' }}>⚠ Not connected to MCP Server</span>}
         </TitleBar.Subtitle>
         <TitleBar.Action>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -1729,7 +1897,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       </TitleBar>
 
       {/* Setup banner */}
-      {!connected && !loading && !loadConfig().serverUrl && (
+      {!connected && !loading && loadConfig().aiMode === 'external-mcp' && !loadConfig().serverUrl && (
         <div style={{ ...bannerStyle, background: 'linear-gradient(135deg, rgba(196,26,22,0.06) 0%, rgba(179,89,0,0.06) 100%)', border: '1px solid rgba(196,26,22,0.3)' }}>
           <div style={{ fontSize: 32, lineHeight: 1 }}>⚙️</div>
           <div style={{ flex: 1 }}>
@@ -1823,14 +1991,33 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           <div style={{ padding: '10px 16px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={panelHeaderStyle}>🤖 Recommendations</span>
             {recommendation && recommendation.role === 'assistant' && (
-              <button
-                onClick={handleGenerateNotebook}
-                disabled={notebookGenerating}
-                title="Generate a Dynatrace Notebook with query and recommendations"
-                style={{ marginLeft: 'auto', padding: '4px 10px', borderRadius: 6, border: '1px solid #6950a1', background: 'rgba(105,80,161,0.08)', color: '#6950a1', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, opacity: notebookGenerating ? 0.6 : 1 }}
-              >
-                {notebookGenerating ? '⏳ Generating...' : '📓 Generate Notebook'}
-              </button>
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                <button
+                  onClick={async () => {
+                    if (!recommendation || enrichingReco) return;
+                    setEnrichingReco(true);
+                    try {
+                      const enriched = await enrichRecommendationContent(recommendation.content);
+                      setRecommendation({ ...recommendation, content: enriched });
+                    } finally {
+                      setEnrichingReco(false);
+                    }
+                  }}
+                  disabled={enrichingReco}
+                  title="Execute DQL queries found in the recommendations and show live results"
+                  style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #00782A', background: 'rgba(0,120,42,0.08)', color: '#00782A', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, opacity: enrichingReco ? 0.6 : 1 }}
+                >
+                  {enrichingReco ? '⏳ Running...' : '▶ Run Queries'}
+                </button>
+                <button
+                  onClick={handleGenerateNotebook}
+                  disabled={notebookGenerating}
+                  title="Generate a Dynatrace Notebook with query and recommendations"
+                  style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #6950a1', background: 'rgba(105,80,161,0.08)', color: '#6950a1', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, opacity: notebookGenerating ? 0.6 : 1 }}
+                >
+                  {notebookGenerating ? '⏳ Generating...' : '📓 Generate Notebook'}
+                </button>
+              </div>
             )}
           </div>
           <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
@@ -1842,22 +2029,41 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             {lastQuery && !recommendation && !recoLoading && (
               <div style={{ textAlign: 'center', marginTop: 30, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
                 <div style={{ fontSize: 13, color: '#666' }}>Results ready for <strong>{lastQuery.label}</strong></div>
-                <button
-                  onClick={handleGetRecommendations}
-                  style={{ ...recoBtnStyle }}
-                >
-                  🤖 Get AI Recommendations
-                </button>
-                <div style={{ fontSize: 11, color: '#999', maxWidth: 280, lineHeight: 1.5 }}>
-                  Claude will analyse the results and use Dynatrace MCP tools for additional context.
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <button
+                    onClick={handleGetRecommendations}
+                    style={{ ...recoBtnStyle }}
+                  >
+                    🤖 Get AI Recommendations
+                  </button>
+                  {loadConfig().claudeEnabled && (
+                    <button
+                      onClick={handleAskClaude}
+                      style={{ ...recoBtnStyle, background: 'linear-gradient(135deg, #D97706 0%, #F59E0B 100%)' }}
+                    >
+                      🧠 Ask Claude
+                    </button>
+                  )}
+                </div>
+                <div style={{ fontSize: 11, color: '#999', maxWidth: 360, lineHeight: 1.5 }}>
+                  {loadConfig().claudeEnabled
+                    ? 'AI Recommendations uses Davis CoPilot. Ask Claude gets Davis context first, then sends to Claude for deeper analysis.'
+                    : 'Enable Claude in Settings to add deeper AI analysis powered by Anthropic.'}
                 </div>
               </div>
             )}
             {recoLoading && (
               <div style={{ textAlign: 'center', marginTop: 30, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
                 <TypingDots />
-                <div style={{ fontSize: 12, color: '#6950a1', fontWeight: 500 }}>🧠 Claude is analysing results... <ElapsedTimer /></div>
-                <div style={{ fontSize: 11, color: '#999', maxWidth: 280, lineHeight: 1.5 }}>Claude will analyse the results and use Dynatrace MCP tools for additional context.</div>
+                <div style={{ fontSize: 12, color: '#6950a1', fontWeight: 500 }}>
+                  {loadConfig().aiMode === 'dynatrace-assist' ? '🧠 Davis is analysing results... ' : '🧠 Claude is analysing results... '}
+                  <ElapsedTimer />
+                </div>
+                <div style={{ fontSize: 11, color: '#999', maxWidth: 280, lineHeight: 1.5 }}>
+                  {loadConfig().aiMode === 'dynatrace-assist'
+                    ? 'Davis CoPilot will analyse the results and provide recommendations.'
+                    : 'Claude will analyse the results and use Dynatrace MCP tools for additional context.'}
+                </div>
               </div>
             )}
             {recommendation && (
@@ -2149,8 +2355,8 @@ function renderMarkdown(text: string): string {
   // Bullet lists
   html = html.replace(/^- (.+)$/gm, '<div style="padding-left:16px">• $1</div>');
 
-  // Markdown links [text](url) — only allow https URLs
-  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');
+  // Markdown links [text](url) — allow https URLs and relative paths
+  html = html.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');
 
   // Bare URLs (not already in an <a> tag)
   html = html.replace(/(?<!href="|&gt;)(https?:\/\/[^\s<&]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');

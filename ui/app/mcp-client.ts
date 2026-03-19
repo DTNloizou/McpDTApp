@@ -1,5 +1,8 @@
 import { functions } from '@dynatrace-sdk/app-utils';
 import { queryExecutionClient } from '@dynatrace-sdk/client-query';
+import { publicClient as davisCopilotClient } from '@dynatrace-sdk/client-davis-copilot';
+import type { ConversationResponse } from '@dynatrace-sdk/client-davis-copilot';
+import { documentsClient } from '@dynatrace-sdk/client-document';
 import { loadConfig } from './config';
 
 export interface ToolCall {
@@ -128,12 +131,85 @@ export async function listTools(overrides?: ConnOverrides): Promise<McpTool[]> {
   return data.tools || [];
 }
 
+/**
+ * Call Davis CoPilot via the official SDK.
+ * Uses the recommenderConversation endpoint (non-streaming).
+ */
+async function davisChat(
+  messages: { role: string; content: string }[]
+): Promise<ChatResponse> {
+  // Build the text from the last user message;
+  // include history as supplementary context
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
+  if (!lastUserMsg) {
+    return { status: 'error', response: '', message: 'No user message provided' };
+  }
+
+  const context: { type: 'supplementary' | 'instruction'; value: string }[] = [];
+
+  // Include conversation history as supplementary context
+  const historyMessages = messages.slice(0, -1);
+  if (historyMessages.length > 0) {
+    const historyText = historyMessages
+      .map((m) => `${m.role}: ${m.content}`)
+      .join('\n\n');
+    context.push({ type: 'supplementary', value: historyText });
+  }
+
+  try {
+    const result = await davisCopilotClient.recommenderConversation({
+      body: {
+        text: lastUserMsg.content,
+        ...(context.length > 0 ? { context } : {}),
+      },
+    });
+
+    // Non-streaming mode returns ConversationResponse
+    const conv = result as ConversationResponse;
+    if (conv.status === 'FAILED') {
+      return { status: 'error', response: '', message: conv.text || 'Davis CoPilot request failed' };
+    }
+
+    return { status: 'success', response: conv.text || '' };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Unknown Davis CoPilot error';
+    return { status: 'error', response: '', message: msg };
+  }
+}
+
+/**
+ * Test Davis CoPilot connectivity by listing available skills.
+ */
+export async function testDavisConnection(): Promise<ConnectionResult> {
+  try {
+    const skills = await davisCopilotClient.listAvailableSkills();
+    return {
+      status: 'success',
+      message: 'Connected',
+      environment: `Dynatrace Assist (${Array.isArray(skills) ? skills.length : 0} skills available)`,
+    };
+  } catch (err: unknown) {
+    return { status: 'error', message: err instanceof Error ? err.message : 'Unknown error' };
+  }
+}
+
 export async function sendChat(
   message: string,
   history: { role: string; content: string }[],
   overrides?: ConnOverrides,
   documents?: { file_id: string; title: string }[]
 ): Promise<ChatResponse> {
+  const config = loadConfig();
+
+  // Route to Davis CoPilot when in dynatrace-assist mode
+  if (config.aiMode === 'dynatrace-assist') {
+    const messages: { role: string; content: string }[] = [
+      ...history,
+      { role: 'user', content: message },
+    ];
+    return davisChat(messages);
+  }
+
   const payload: Record<string, unknown> = { message, history };
 
   // If documents have been synced to Anthropic, pass their file references
@@ -232,10 +308,22 @@ export async function getRecommendations(
     `1. **Summary** — brief interpretation of the results`,
     `2. **Key Findings** — highlight anything concerning or noteworthy`,
     `3. **Recommendations** — specific, actionable steps to resolve issues or improve the situation`,
-    `4. **Related Areas to Investigate** — suggest follow-up DQL queries or areas to look at`,
+    `4. **Related Areas to Investigate** — suggest follow-up DQL queries to drill deeper`,
+    ``,
+    `IMPORTANT: When suggesting DQL queries, ALWAYS format them inside \`\`\`dql code blocks so they can be executed automatically. For example:`,
+    '```dql',
+    'fetch bizevents, from:now()-7d | filter event.provider == "example" | summarize count()',
+    '```',
     ``,
     `Be concise and practical. Use bullet points. If the results look healthy, say so.`,
   ].join('\n');
+
+  const config = loadConfig();
+
+  // Route to Davis CoPilot when in dynatrace-assist mode
+  if (config.aiMode === 'dynatrace-assist') {
+    return davisChat([{ role: 'user', content: prompt }]);
+  }
 
   const payload: Record<string, unknown> = { message: prompt, history: [] };
   if (documents && documents.length > 0) {
@@ -243,4 +331,165 @@ export async function getRecommendations(
   }
 
   return proxyCall('/chat', 'POST', payload, overrides) as Promise<ChatResponse>;
+}
+
+/**
+ * Ask Claude directly (via in-app serverless function) with Davis CoPilot context.
+ * Flow: Davis analyses first → Claude gets Davis context + raw data → deep analysis.
+ * No external MCP proxy needed.
+ */
+export async function getClaudeRecommendations(
+  queryLabel: string,
+  queryDql: string,
+  queryResults: string,
+  kbContext?: string,
+): Promise<ChatResponse> {
+  const config = loadConfig();
+  const anthropicApiKey = config.claudeApiKey;
+
+  if (!anthropicApiKey) {
+    return { status: 'error', response: '', message: 'Anthropic API key not configured. Enable Claude in Settings and add your API key.' };
+  }
+
+  const trimmedResults = queryResults.length > 8000
+    ? queryResults.slice(0, 8000) + '\n\n… (results truncated for brevity)'
+    : queryResults;
+
+  // Step 1: Get Davis CoPilot context
+  let davisContext = '';
+  try {
+    const davisPrompt = [
+      `Analyse the following Dynatrace query results and provide context about the environment, related problems, and any relevant observations.`,
+      ``,
+      `**Query:** ${queryLabel}`,
+      `**DQL:** \`${queryDql}\``,
+      `**Results:**`,
+      trimmedResults,
+    ].join('\n');
+
+    const davisResult = await davisChat([{ role: 'user', content: davisPrompt }]);
+    if (davisResult.status === 'success' && davisResult.response) {
+      davisContext = davisResult.response;
+    }
+  } catch {
+    // Davis context is optional — continue without it
+  }
+
+  // Step 2: Send to Claude with Davis context
+  const systemPrompt = [
+    `You are a Dynatrace SRE expert. You have been given query results from Dynatrace and contextual analysis from Davis CoPilot (Dynatrace's built-in AI).`,
+    `Provide a deep, actionable analysis that builds on Davis's insights.`,
+    ...(kbContext ? [``, `Reference documents:`, kbContext] : []),
+  ].join('\n');
+
+  const userMessage = [
+    `**Query:** ${queryLabel}`,
+    `**DQL:** \`${queryDql}\``,
+    ``,
+    `**Query Results:**`,
+    trimmedResults,
+    ...(davisContext ? [
+      ``,
+      `---`,
+      `**Davis CoPilot Analysis (Dynatrace-native context):**`,
+      davisContext,
+      `---`,
+    ] : []),
+    ``,
+    `Based on the query results${davisContext ? ' and Davis CoPilot analysis' : ''}, provide:`,
+    `1. **Summary** — interpretation enriched with the Davis context`,
+    `2. **Key Findings** — anything concerning or noteworthy`,
+    `3. **Recommendations** — specific, actionable steps`,
+    `4. **Follow-up Queries** — additional DQL queries to drill deeper, formatted in \`\`\`dql code blocks`,
+    ``,
+    `Be concise and practical. Use bullet points.`,
+  ].join('\n');
+
+  try {
+    const res = await functions.call('anthropic-chat', {
+      data: {
+        anthropicApiKey,
+        messages: [{ role: 'user', content: userMessage }],
+        systemPrompt,
+        maxTokens: 4096,
+      },
+    });
+
+    const result = await res.json() as { status: string; response?: string; message?: string; usage?: { input_tokens: number; output_tokens: number } };
+
+    if (result.status === 'success') {
+      return { status: 'success', response: result.response || '', usage: result.usage };
+    }
+    return { status: 'error', response: '', message: result.message || 'Claude request failed' };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Unknown error calling Claude';
+    return { status: 'error', response: '', message: msg };
+  }
+}
+
+/**
+ * Notebook section definition for building notebook content.
+ */
+interface NotebookSection {
+  type: 'markdown' | 'dql';
+  content: string;
+}
+
+/**
+ * Create a Dynatrace Notebook using the Document SDK.
+ * Returns the notebook ID so the UI can link to it.
+ */
+export async function createNotebook(
+  title: string,
+  sections: NotebookSection[]
+): Promise<{ status: string; notebookId?: string; message?: string }> {
+  // Build the notebook JSON content following the Dynatrace notebook schema
+  const cells = sections.map((section, idx) => {
+    if (section.type === 'dql') {
+      return {
+        id: `cell-${idx}`,
+        type: 'code' as const,
+        language: 'dql',
+        content: section.content,
+      };
+    }
+    return {
+      id: `cell-${idx}`,
+      type: 'markdown' as const,
+      content: section.content,
+    };
+  });
+
+  const notebookContent = JSON.stringify({
+    version: '1',
+    defaultTimeframe: { from: 'now()-2h', to: 'now()' },
+    sections: cells.map((cell) => ({
+      id: cell.id,
+      type: cell.type === 'code' ? 'dqlQuery' : 'markdown',
+      ...(cell.type === 'code'
+        ? {
+            state: { input: { value: cell.content } },
+            davisAnalysis: { analyzerComponentState: { resultState: {} } },
+            visualization: 'table',
+            visualizationSettings: {},
+            querySettings: { maxResultRecords: 1000 },
+          }
+        : { content: cell.content }),
+    })),
+  });
+
+  try {
+    const result = await documentsClient.createDocument({
+      body: {
+        name: title,
+        type: 'notebook',
+        content: new Blob([notebookContent], { type: 'application/json' }),
+      },
+    });
+
+    return { status: 'success', notebookId: result.id };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : 'Failed to create notebook';
+    return { status: 'error', message: msg };
+  }
 }
