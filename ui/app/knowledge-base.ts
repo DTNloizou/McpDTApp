@@ -199,11 +199,21 @@ export async function uploadDocToAnthropic(
     },
   });
 
-  const result = (await res.json()) as { ok?: boolean; data?: { id?: string }; error?: string };
+  const result = (await res.json()) as {
+    ok?: boolean;
+    status?: number;
+    data?: { id?: string; type?: string; error?: { type?: string; message?: string } };
+    error?: string;
+  };
 
   if (result.error) throw new Error(result.error);
   if (!result.ok || !result.data?.id) {
-    throw new Error(`Upload failed: ${JSON.stringify(result.data)}`);
+    // Extract the nested Anthropic error message if present
+    const apiError = result.data?.error?.message || result.data?.error?.type;
+    const detail = apiError
+      ? `Anthropic ${result.status || '?'}: ${apiError}`
+      : `Upload failed (HTTP ${result.status || '?'}): ${JSON.stringify(result.data).slice(0, 200)}`;
+    throw new Error(detail);
   }
 
   const fileId = result.data.id;

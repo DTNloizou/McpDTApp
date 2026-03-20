@@ -50,7 +50,7 @@ export default async function (payload: FilesPayload) {
 
         // Build multipart/form-data manually (FormData is not available in this runtime)
         const boundary = '----AnthropicFileBoundary' + Date.now();
-        const body = [
+        const parts = [
           `--${boundary}`,
           `Content-Disposition: form-data; name="file"; filename="${safeName}"`,
           `Content-Type: text/plain`,
@@ -65,10 +65,16 @@ export default async function (payload: FilesPayload) {
             ...baseHeaders,
             'Content-Type': `multipart/form-data; boundary=${boundary}`,
           },
-          body,
+          body: parts,
         });
 
-        const data = await res.json();
+        const responseText = await res.text();
+        let data: unknown;
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          data = { rawResponse: responseText.slice(0, 500) };
+        }
         return { status: res.status, ok: res.ok, data };
       }
 

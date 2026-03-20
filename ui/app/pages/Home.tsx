@@ -2,9 +2,11 @@ import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, f
 import { Flex } from '@dynatrace/strato-components/layouts';
 import { TitleBar } from '@dynatrace/strato-components-preview/layouts';
 import { sendChat, testConnection, testDavisConnection, executeDql, getRecommendations, getClaudeRecommendations, repairDqlWithClaude, createNotebook, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
+import { getEnvironmentUrl } from '@dynatrace-sdk/app-environment';
 import { loadConfig } from '../config';
 import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
 import { loadCustomCategories, getCustomCategories, saveCustomCategories, type CustomCategory, type CustomQuery } from '../custom-queries';
+import { autoPopulateKB, type PopulateProgress } from '../kb-auto-populate';
 
 interface Message {
   role: 'user' | 'assistant' | 'system' | 'error';
@@ -197,7 +199,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   const [discoveryPlaceholders, setDiscoveryPlaceholders] = useState<DiscoveryPlaceholder[]>([]);
   const [discoveryStatus, setDiscoveryStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle');
   const [discoveryMessage, setDiscoveryMessage] = useState('');
+  const [dqlPopStatus, setDqlPopStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle');
+  const [dqlPopProgress, setDqlPopProgress] = useState<PopulateProgress | null>(null);
+  const [dqlPopMessage, setDqlPopMessage] = useState('');
   const [completedDiscoveryKeys, setCompletedDiscoveryKeys] = useState<Set<string>>(new Set());
+  const [syncError, setSyncError] = useState('');
   const [fileUploadStatus, setFileUploadStatus] = useState<Record<string, 'uploading' | 'done' | 'error'>>({});
   const [resolvingPlaceholders, setResolvingPlaceholders] = useState(false);
   const [viewingDoc, setViewingDoc] = useState<KBDocument | null>(null);
@@ -406,19 +412,148 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
 
       if (config.aiMode === 'dynatrace-assist') {
         // Build notebook directly using the Document SDK
-        const recoText = recommendation.content.slice(0, 3000);
+        const recoText = recommendation.content.slice(0, 5000);
+
+        // Clean the recommendation text:
+        // 1. Strip XML tags from Davis CoPilot responses
+        // 2. Remove inlined query execution results (from enrichRecommendationContent)
+        // 3. Remove CUSTOM_INFO MCP blocks and raw JSON result dumps
+        let cleanText = recoText
+          // Remove entire <function_calls>...</function_calls> blocks including content
+          .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
+          // Remove any remaining XML-like tags
+          .replace(/<\/?(?:function_calls|antml:[a-z]+|result|output|name|invoke)[^>]*>/g, '')
+          // Remove CUSTOM_INFO MCP Query Execution lines and their JSON payloads
+          .replace(/CUSTOM_INFO\s+MCP\s+Query\s+Execution[^\n]*\n?/g, '')
+          // Remove "Query returned no data:" error blocks
+          .replace(/Query returned no data:[\s\S]*?(?=\n\n|\n#{1,3}\s|$)/g, '')
+          // Remove inlined result tables (### 📊 Query Results... through the end of the table)
+          .replace(/###\s*📊\s*Query Results[\s\S]*?(?=\n\n(?:#{1,3}\s|\*\*|$))/g, '')
+          // Remove "Query Results (N records):" blocks and their markdown tables
+          .replace(/Query Results\s*\(\d+\s*records?\):[\s\S]*?(?=\n\n(?:#{1,3}\s|\*\*|[A-Z])|$)/g, '')
+          // Remove raw JSON arrays that were inlined as results
+          .replace(/\n```json\n[\s\S]*?\n```\n?/g, '\n')
+          // Collapse excessive blank lines
+          .replace(/\n{3,}/g, '\n\n')
+          .trim();
+
+        // Split recommendation content into markdown + DQL sections
+        // Extract only the DQL queries (not results) into executable notebook tiles
+        const recoSections: { type: 'markdown' | 'dql'; content: string }[] = [];
+
+        // First pass: extract fenced code blocks (```dql or ```sql or ```)
+        // Second pass: extract unfenced DQL statements (lines starting with fetch/timeseries)
+        const dqlBlockRe = /```(?:dql|sql)?[ \t]*\n([\s\S]*?)```/g;
+        let lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = dqlBlockRe.exec(cleanText)) !== null) {
+          const dql = match[1].trim();
+          if (dql.startsWith('fetch ') || dql.startsWith('timeseries ')) {
+            const before = cleanText.slice(lastIndex, match.index).trim();
+            if (before) recoSections.push({ type: 'markdown', content: before });
+            recoSections.push({ type: 'dql', content: dql });
+            lastIndex = match.index + match[0].length;
+          }
+        }
+        const afterFenced = cleanText.slice(lastIndex).trim();
+
+        // If no fenced DQL blocks were found, scan for unfenced DQL statements in the text
+        // (Davis CoPilot sometimes returns DQL as inline text without code fences)
+        if (recoSections.length === 0 && afterFenced) {
+          const lines = afterFenced.split('\n');
+          let mdBuffer: string[] = [];
+          let dqlBuffer: string[] = [];
+          let inDql = false;
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            const isDqlStart = /^(?:fetch |timeseries )/.test(trimmed);
+            const isDqlContinuation = inDql && /^\|/.test(trimmed);
+
+            if (isDqlStart || isDqlContinuation) {
+              if (!inDql && mdBuffer.length > 0) {
+                recoSections.push({ type: 'markdown', content: mdBuffer.join('\n').trim() });
+                mdBuffer = [];
+              }
+              inDql = true;
+              dqlBuffer.push(trimmed);
+            } else {
+              if (inDql && dqlBuffer.length > 0) {
+                recoSections.push({ type: 'dql', content: dqlBuffer.join(' ') });
+                dqlBuffer = [];
+                inDql = false;
+              }
+              mdBuffer.push(line);
+            }
+          }
+          // Flush remaining buffers
+          if (dqlBuffer.length > 0) {
+            recoSections.push({ type: 'dql', content: dqlBuffer.join(' ') });
+          }
+          if (mdBuffer.length > 0) {
+            const md = mdBuffer.join('\n').trim();
+            if (md) recoSections.push({ type: 'markdown', content: md });
+          }
+        } else if (afterFenced) {
+          recoSections.push({ type: 'markdown', content: afterFenced });
+        }
+
+        // If still nothing, just use the cleaned text as a single markdown section
+        if (recoSections.length === 0) {
+          recoSections.push({ type: 'markdown', content: cleanText });
+        }
+
+        // Final pass: strip "Query Results (N records):" blocks and markdown tables
+        // from all markdown sections (these are inlined execution results)
+        const cleanMarkdownSection = (md: string): string => {
+          const lines = md.split('\n');
+          const out: string[] = [];
+          let skipping = false;
+
+          for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const trimmed = line.trim();
+
+            // Detect "Query Results (N records):" — start skipping
+            if (/^(\*\*)?Query Results/i.test(trimmed)) {
+              skipping = true;
+              continue;
+            }
+
+            if (skipping) {
+              // Skip "No records returned", blank lines, and markdown table rows
+              if (trimmed === '' || /^No records returned$/i.test(trimmed) || trimmed.startsWith('|')) {
+                continue;
+              }
+              // Non-table, non-empty line — stop skipping
+              skipping = false;
+            }
+
+            out.push(line);
+          }
+
+          return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        };
+
+        const cleanedRecoSections = recoSections.map(s =>
+          s.type === 'markdown' ? { ...s, content: cleanMarkdownSection(s.content) } : s
+        ).filter(s => s.content.length > 0);
+
         const sections: { type: 'markdown' | 'dql'; content: string }[] = [
           { type: 'markdown', content: `# ${lastQuery.label}\n\nGenerated from the Query Explorer with AI recommendations.` },
           { type: 'markdown', content: `## Original Query` },
           { type: 'dql', content: lastQuery.dql },
-          { type: 'markdown', content: `## Recommendations\n\n${recoText}` },
+          { type: 'markdown', content: `## Recommendations` },
+          ...cleanedRecoSections,
         ];
 
         const result = await createNotebook(`${lastQuery.label} — Analysis`, sections);
         if (result.status === 'success' && result.notebookId) {
+          const envUrl = getEnvironmentUrl().replace(/\/$/, '');
+          window.open(`${envUrl}/ui/apps/dynatrace.notebooks/notebook/${result.notebookId}`, '_blank');
           setRecommendation({
             role: 'assistant',
-            content: `**Notebook created successfully.**\n\n[Open Notebook →](/ui/apps/dynatrace.notebooks/notebook/${result.notebookId})\n\n${recoText}`,
+            content: `**Notebook created successfully.** Opening in a new tab...\n\n${recoText}`,
           });
         } else {
           setRecommendation({ role: 'error', content: `Failed to create notebook: ${result.message}` });
@@ -471,7 +606,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         if (result.status === 'success') {
           const urlMatch = result.response?.match(/notebook\/([a-zA-Z0-9-]+)/);
           if (urlMatch) {
-            window.open(`/ui/apps/dynatrace.notebooks/notebook/${urlMatch[1]}`, '_blank');
+            const envUrl = getEnvironmentUrl().replace(/\/$/, '');
+            window.open(`${envUrl}/ui/apps/dynatrace.notebooks/notebook/${urlMatch[1]}`, '_blank');
           }
           setRecommendation({ role: 'assistant', content: result.response || 'Notebook created successfully.' });
           const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
@@ -634,6 +770,32 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       enriched = enriched.slice(0, endPos) + insertText + enriched.slice(endPos);
     }
     return enriched;
+  };
+
+  const handleExportRecommendationsMd = () => {
+    if (!recommendation || recommendation.role !== 'assistant') return;
+    const now = new Date();
+    const stamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const title = lastQuery?.label || 'Recommendations';
+    const lines: string[] = [
+      `# ${title}`,
+      '',
+      `> Exported on ${now.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })} at ${now.toLocaleTimeString('en-GB')}`,
+      '',
+    ];
+    if (lastQuery) {
+      lines.push('## Query', '', '```dql', lastQuery.dql, '```', '');
+    }
+    lines.push('## AI Recommendations', '', recommendation.content, '');
+    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${title.replace(/[^a-zA-Z0-9_ -]/g, '').trim().replace(/\s+/g, '_')}_${stamp}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const handleGetRecommendations = async () => {
@@ -1245,78 +1407,13 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 );
               })}
 
-              {/* Placeholder replacement */}
-              {placeholders.length > 0 && (
-                <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(255,149,0,0.06) 0%, rgba(255,100,0,0.06) 100%)', border: '1px solid rgba(255,149,0,0.25)' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)' }}>
-                      🔧 Replace Placeholders
-                    </div>
-                    {placeholders.some((ph) => !placeholderValues[ph.token]?.trim()) && (
-                      <button
-                        onClick={handleAutoResolvePlaceholders}
-                        disabled={resolvingPlaceholders}
-                        style={{
-                          padding: '5px 12px',
-                          borderRadius: 6,
-                          border: '1px solid rgba(105,80,161,0.3)',
-                          background: resolvingPlaceholders ? 'rgba(105,80,161,0.08)' : 'rgba(105,80,161,0.12)',
-                          color: '#6950a1',
-                          fontSize: 11,
-                          fontWeight: 600,
-                          cursor: resolvingPlaceholders ? 'not-allowed' : 'pointer',
-                          opacity: resolvingPlaceholders ? 0.7 : 1,
-                        }}
-                      >
-                        {resolvingPlaceholders ? '⏳ Resolving...' : '🤖 Ask Claude'}
-                      </button>
-                    )}
-                  </div>
-                  <div style={{ fontSize: 11, color: '#888', marginBottom: 12 }}>
-                    {placeholders.length} placeholder{placeholders.length === 1 ? '' : 's'} detected. Claude can auto-resolve these from your Dynatrace environment, or fill them in manually.
-                  </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                    {placeholders.map((ph) => (
-                      <div key={ph.token} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <div style={{ minWidth: 140, fontSize: 12 }}>
-                          <span style={{ fontWeight: 600, color: '#b36305' }}>{ph.friendlyName}</span>
-                          <span style={{ color: '#999', marginLeft: 4, fontSize: 11 }}>×{ph.occurrences}</span>
-                        </div>
-                        <input
-                          type="text"
-                          placeholder={ph.token}
-                          value={placeholderValues[ph.token] || ''}
-                          onChange={(e) => handlePlaceholderChange(ph.token, e.target.value)}
-                          style={{
-                            flex: 1,
-                            padding: '6px 10px',
-                            borderRadius: 6,
-                            border: '1px solid ' + (placeholderValues[ph.token]?.trim() ? '#00a86b' : '#e0a000'),
-                            background: 'var(--dt-colors-background-base-default, #fff)',
-                            fontSize: 12,
-                            color: 'var(--dt-colors-text-primary-default, #2c2d4d)',
-                            outline: 'none',
-                          }}
-                        />
-                        {placeholderValues[ph.token]?.trim() && (
-                          <span style={{ color: '#00a86b', fontSize: 14 }}>✓</span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                  {placeholders.some((ph) => !placeholderValues[ph.token]?.trim()) && (
-                    <div style={{ fontSize: 11, color: '#e0a000', marginTop: 8, fontStyle: 'italic' }}>
-                      ⚠ Unfilled placeholders will remain as-is in the documents.
-                    </div>
-                  )}
-                </div>
-              )}
-
               {/* Upload status summary */}
               {(() => {
                 const totalDocs = kbDocs.length;
                 const syncedDocs = kbDocs.filter((d) => getDocSyncStatus(d.name) === 'synced').length;
-                const hasApiKey = !!loadConfig().agent?.apiKey;
+                const config = loadConfig();
+                const anthropicKey = config.claudeApiKey || config.agent?.apiKey || '';
+                const hasApiKey = !!anthropicKey;
                 const allSynced = syncedDocs === totalDocs && totalDocs > 0;
                 const hasPending = syncedDocs < totalDocs;
 
@@ -1340,20 +1437,22 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                     {hasApiKey && hasPending && (
                       <button
                         onClick={async () => {
-                          const config = loadConfig();
-                          const anthropicKey = config.agent?.apiKey;
                           if (!anthropicKey) return;
+                          setSyncError('');
                           const pending = kbDocs.filter((d) => getDocSyncStatus(d.name) !== 'synced');
+                          let lastError = '';
                           for (const doc of pending) {
                             setFileUploadStatus((prev) => ({ ...prev, [doc.name]: 'uploading' }));
                             try {
                               const content = applyReplacements(doc.content, placeholderValues);
                               await uploadDocToAnthropic(doc.name, content, anthropicKey);
                               setFileUploadStatus((prev) => ({ ...prev, [doc.name]: 'done' }));
-                            } catch {
+                            } catch (err) {
+                              lastError = err instanceof Error ? err.message : 'Unknown error';
                               setFileUploadStatus((prev) => ({ ...prev, [doc.name]: 'error' }));
                             }
                           }
+                          if (lastError) setSyncError(lastError);
                           setKbDocs(getKBDocuments());
                         }}
                         style={{
@@ -1370,6 +1469,71 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 </div>
                 );
               })()}
+
+              {syncError && (
+                <div style={{ marginTop: 8, padding: '10px 14px', borderRadius: 8, background: 'rgba(227,32,23,0.08)', border: '1px solid rgba(227,32,23,0.2)', fontSize: 11, color: '#c62828', wordBreak: 'break-all', maxHeight: 200, overflowY: 'auto', fontFamily: 'monospace', whiteSpace: 'pre-wrap' }}>
+                  ✕ Sync error: {syncError}
+                </div>
+              )}
+
+              {/* DQL Auto-Populate — no AI needed */}
+              <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(0,168,107,0.08) 0%, rgba(0,120,42,0.08) 100%)', border: '1px solid ' + (dqlPopStatus === 'success' ? 'rgba(0,168,107,0.3)' : dqlPopStatus === 'error' ? 'rgba(227,32,23,0.3)' : 'rgba(0,168,107,0.25)') }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
+                      {dqlPopStatus === 'success' ? '✅ Auto-population complete' : dqlPopStatus === 'error' ? '❌ Auto-population failed' : dqlPopStatus === 'running' ? '⏳ Auto-populating...' : '⚡ Auto-Populate with DQL'}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#888', whiteSpace: 'pre-wrap', maxHeight: 160, overflowY: 'auto' }}>
+                      {dqlPopStatus === 'running'
+                        ? (dqlPopProgress ? `${dqlPopProgress.phase}: ${dqlPopProgress.detail}` : 'Starting...')
+                        : dqlPopStatus === 'success' || dqlPopStatus === 'error'
+                          ? dqlPopMessage
+                          : 'Run DQL queries directly against your environment to populate reference docs. No AI or API keys needed.'}
+                    </div>
+                    {dqlPopStatus === 'running' && dqlPopProgress && (
+                      <div style={{ marginTop: 6, height: 4, borderRadius: 2, background: 'var(--dt-colors-border-neutral-default, #e0e0e0)', overflow: 'hidden' }}>
+                        <div style={{ height: '100%', width: `${dqlPopProgress.pct}%`, background: '#00a86b', borderRadius: 2, transition: 'width 0.3s' }} />
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    onClick={async () => {
+                      if (dqlPopStatus === 'running') return;
+                      setDqlPopStatus('running');
+                      setDqlPopMessage('');
+                      setDqlPopProgress(null);
+                      try {
+                        const result = await autoPopulateKB((progress) => {
+                          setDqlPopProgress({ ...progress });
+                        });
+                        setKbDocs(getKBDocuments());
+                        setDiscoveryPlaceholders(detectDiscoveryPlaceholders());
+                        const parts: string[] = [];
+                        if (result.updated.length) parts.push(`Updated: ${result.updated.join(', ')}`);
+                        if (result.errors.length) parts.push(`\nWarnings: ${result.errors.join('; ')}`);
+                        setDqlPopMessage(parts.join('\n') || 'Complete — no changes needed');
+                        setDqlPopStatus(result.errors.length > 0 && result.updated.length === 0 ? 'error' : 'success');
+                      } catch (err) {
+                        setDqlPopMessage(err instanceof Error ? err.message : 'Auto-populate failed');
+                        setDqlPopStatus('error');
+                      } finally {
+                        setDqlPopProgress(null);
+                      }
+                    }}
+                    disabled={dqlPopStatus === 'running'}
+                    style={{
+                      ...recoBtnStyle,
+                      fontSize: 13,
+                      padding: '10px 18px',
+                      background: dqlPopStatus === 'success' ? '#00a86b' : dqlPopStatus === 'error' ? '#e32017' : '#00782A',
+                      opacity: dqlPopStatus === 'running' ? 0.5 : 1,
+                      cursor: dqlPopStatus === 'running' ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {dqlPopStatus === 'running' ? '⏳ Running...' : dqlPopStatus === 'success' ? '🔄 Re-run' : dqlPopStatus === 'error' ? '🔄 Retry' : '⚡ Populate'}
+                  </button>
+                </div>
+              </div>
 
               {/* AI Discovery — populate *(Add as discovered)* template rows */}
               {discoveryPlaceholders.length > 0 && (
@@ -2016,7 +2180,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       {/* Bottom: Output + Recommendations side by side */}
       <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', minHeight: 0 }}>
         {/* Output panel */}
-        <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, borderRight: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0, borderRight: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)' }}>
           <div style={{ padding: '10px 16px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={panelHeaderStyle}>Output</span>
             {output.length > 0 && (
@@ -2025,7 +2189,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
               </button>
             )}
           </div>
-          <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+          <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
             {output.length === 0 && !loading && (
               <div style={{ textAlign: 'center', color: '#999', marginTop: 40, fontSize: 13 }}>
                 Select a category and click a query to see results here.
@@ -2045,7 +2209,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         </div>
 
         {/* Recommendations panel */}
-        <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
           <div style={{ padding: '10px 16px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={panelHeaderStyle}>🤖 Recommendations</span>
             {recommendation && recommendation.role === 'assistant' && (
@@ -2075,10 +2239,17 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 >
                   {notebookGenerating ? '⏳ Generating...' : '📓 Generate Notebook'}
                 </button>
+                <button
+                  onClick={handleExportRecommendationsMd}
+                  title="Export recommendations as a formatted Markdown file"
+                  style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #1976d2', background: 'rgba(25,118,210,0.08)', color: '#1976d2', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+                >
+                  📄 Export MD
+                </button>
               </div>
             )}
           </div>
-          <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+          <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
             {!lastQuery && !recoLoading && !recommendation && (
               <div style={{ textAlign: 'center', color: '#999', marginTop: 40, fontSize: 13 }}>
                 Run a query first, then get AI-powered recommendations based on the results.
@@ -2343,29 +2514,44 @@ const kbSmallBtnStyle: React.CSSProperties = {
 /* ─── Simple markdown renderer ─── */
 
 function renderMarkdown(text: string): string {
-  // Escape HTML first to prevent XSS
-  let html = text
+  // First, strip any leaked XML-like blocks (function calls, invoke tags, etc.)
+  let cleaned = text
+    .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
+    .replace(/<invoke[\s\S]*?<\/invoke>/g, '')
+    .replace(/<parameter[\s\S]*?<\/parameter>/g, '')
+    .trim();
+
+  // Escape HTML to prevent XSS
+  let html = cleaned
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
   // Code blocks (``` ... ```)
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) =>
-    `<pre style="background:#1e1e2e;color:#cdd6f4;padding:12px;border-radius:8px;overflow-x:auto;font-size:12px;margin:8px 0">${code.trim()}</pre>`
+    `<pre style="background:#1e1e2e;color:#cdd6f4;padding:12px;border-radius:8px;overflow-x:auto;font-size:12px;margin:12px 0">${code.trim()}</pre>`
   );
 
   // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code style="background:rgba(105,80,161,0.12);padding:2px 6px;border-radius:4px;font-size:12px">$1</code>');
+  html = html.replace(/`([^`]+)`/g, '<code style="background:rgba(105,80,161,0.15);padding:2px 6px;border-radius:4px;font-size:12px;font-family:monospace">$1</code>');
 
-  // Headers
-  html = html.replace(/^#### (.+)$/gm, '<div style="font-size:14px;font-weight:700;margin:12px 0 6px">$1</div>');
-  html = html.replace(/^### (.+)$/gm, '<div style="font-size:15px;font-weight:700;margin:12px 0 6px">$1</div>');
-  html = html.replace(/^## (.+)$/gm, '<div style="font-size:16px;font-weight:700;margin:12px 0 6px">$1</div>');
+  // Headers with better styling
+  // H1 - major sections with top border
+  html = html.replace(/^# (.+)$/gm, '<div style="font-size:18px;font-weight:700;margin:20px 0 10px;padding-top:16px;border-top:2px solid rgba(105,80,161,0.3)">$1</div>');
+  // H2 - section headers
+  html = html.replace(/^## (.+)$/gm, '<div style="font-size:16px;font-weight:700;margin:18px 0 8px;color:#4a4a6a">$1</div>');
+  // H3 - subsection headers
+  html = html.replace(/^### (.+)$/gm, '<div style="font-size:15px;font-weight:600;margin:14px 0 6px;color:#5a5a7a">$1</div>');
+  // H4 - minor headers
+  html = html.replace(/^#### (.+)$/gm, '<div style="font-size:14px;font-weight:600;margin:10px 0 4px;color:#6a6a8a">$1</div>');
 
   // Bold + italic
   html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // Horizontal rules
+  html = html.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid rgba(105,80,161,0.2);margin:16px 0"/>');
 
   // Markdown tables
   html = html.replace(/((?:^\|.+\|$\n?)+)/gm, (_match, tableBlock: string) => {
@@ -2386,12 +2572,12 @@ function renderMarkdown(text: string): string {
       ? parseRow(lines[1]).map((cell: string) => (cell.trim().endsWith(':') ? 'right' : 'left'))
       : headers.map(() => 'left');
 
-    let table = '<div style="overflow-x:auto;margin:8px 0"><table style="width:100%;border-collapse:collapse;font-size:13px">';
+    let table = '<div style="overflow-x:auto;margin:12px 0;max-width:100%"><table style="width:100%;border-collapse:collapse;font-size:13px;table-layout:auto;border-radius:8px;overflow:hidden">';
 
     // Header
     table += '<thead><tr>';
     headers.forEach((h: string, i: number) => {
-      table += `<th style="padding:8px 12px;text-align:${alignments[i] || 'left'};background:#6950a1;color:#fff;font-weight:600;white-space:nowrap">${h}</th>`;
+      table += `<th style="padding:10px 12px;text-align:${alignments[i] || 'left'};background:#6950a1;color:#fff;font-weight:600;white-space:nowrap">${h}</th>`;
     });
     table += '</tr></thead>';
 
@@ -2399,10 +2585,10 @@ function renderMarkdown(text: string): string {
     table += '<tbody>';
     for (let r = dataStart; r < lines.length; r++) {
       const cells = parseRow(lines[r]);
-      const bg = (r - dataStart) % 2 === 0 ? 'transparent' : 'rgba(105,80,161,0.05)';
+      const bg = (r - dataStart) % 2 === 0 ? 'transparent' : 'rgba(105,80,161,0.06)';
       table += `<tr style="background:${bg}">`;
       cells.forEach((cell: string, i: number) => {
-        table += `<td style="padding:6px 12px;text-align:${alignments[i] || 'left'};border-bottom:1px solid rgba(0,0,0,0.06);white-space:nowrap">${cell}</td>`;
+        table += `<td style="padding:8px 12px;text-align:${alignments[i] || 'left'};border-bottom:1px solid rgba(0,0,0,0.08)">${cell}</td>`;
       });
       table += '</tr>';
     }
@@ -2410,8 +2596,11 @@ function renderMarkdown(text: string): string {
     return table;
   });
 
-  // Bullet lists
-  html = html.replace(/^- (.+)$/gm, '<div style="padding-left:16px">• $1</div>');
+  // Numbered lists (1. item, 2. item, etc.)
+  html = html.replace(/^(\d+)\. (.+)$/gm, '<div style="padding-left:20px;margin:4px 0"><span style="color:#6950a1;font-weight:600;margin-right:6px">$1.</span>$2</div>');
+
+  // Bullet lists - improved styling
+  html = html.replace(/^[•\-] (.+)$/gm, '<div style="padding-left:20px;margin:4px 0;position:relative"><span style="position:absolute;left:6px;color:#6950a1">•</span>$1</div>');
 
   // Markdown links [text](url) — allow https URLs and relative paths
   html = html.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');
@@ -2420,7 +2609,7 @@ function renderMarkdown(text: string): string {
   html = html.replace(/(?<!href="|&gt;)(https?:\/\/[^\s<&]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');
 
   // Line breaks (double newline = paragraph, single = br)
-  html = html.replace(/\n\n/g, '<div style="height:8px"></div>');
+  html = html.replace(/\n\n/g, '<div style="height:12px"></div>');
   html = html.replace(/\n/g, '<br/>');
 
   return html;
@@ -2479,7 +2668,7 @@ function MessageBubble({ message, previousMessage, onSaveToKB }: {
   };
 
   return (
-    <div style={{ alignSelf: isUser ? 'flex-end' : 'flex-start', maxWidth: isSystem ? '100%' : '90%' }}>
+    <div style={{ alignSelf: isUser ? 'flex-end' : 'flex-start', maxWidth: isSystem ? '100%' : '90%', minWidth: 0 }}>
       <div
         style={{
           padding: isSystem ? '6px 12px' : '10px 16px',
@@ -2489,6 +2678,7 @@ function MessageBubble({ message, previousMessage, onSaveToKB }: {
           fontSize: isSystem ? 12 : 14,
           lineHeight: 1.5,
           wordBreak: 'break-word',
+          overflowX: 'auto',
           ...(isAssistant ? {} : { whiteSpace: 'pre-wrap' as const }),
         }}
       >

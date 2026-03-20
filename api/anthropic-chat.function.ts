@@ -4,11 +4,26 @@
  * Calls the Anthropic Messages API from within the Dynatrace JavaScript Runtime.
  * This avoids the AppShell fetch interception and lets the app call Claude
  * directly without an external MCP proxy.
+ *
+ * Supports file references: if `documents` is provided, the first user message
+ * is augmented with document content blocks referencing Anthropic file_ids.
  */
+
+interface ContentBlock {
+  type: 'text' | 'document';
+  text?: string;
+  source?: { type: 'file'; file_id: string };
+  title?: string;
+}
 
 interface ChatMessage {
   role: 'user' | 'assistant';
-  content: string;
+  content: string | ContentBlock[];
+}
+
+interface DocumentRef {
+  file_id: string;
+  title: string;
 }
 
 interface ChatPayload {
@@ -16,13 +31,16 @@ interface ChatPayload {
   messages: ChatMessage[];
   systemPrompt?: string;
   maxTokens?: number;
+  /** Anthropic file_ids to include as document blocks in the first user message */
+  documents?: DocumentRef[];
 }
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
+const FILES_BETA = 'files-api-2025-04-14';
 
 export default async function (payload: ChatPayload) {
-  const { anthropicApiKey, messages, systemPrompt, maxTokens = 4096 } = payload;
+  const { anthropicApiKey, messages, systemPrompt, maxTokens = 4096, documents } = payload;
 
   if (!anthropicApiKey) {
     return { status: 'error', message: 'Anthropic API key is required' };
@@ -31,10 +49,37 @@ export default async function (payload: ChatPayload) {
     return { status: 'error', message: 'messages array is required' };
   }
 
+  // If documents are provided, convert the first user message to content blocks
+  // so file_ids are attached as document references per the Anthropic schema.
+  const apiMessages: ChatMessage[] = messages.map((msg, idx) => {
+    if (idx === 0 && msg.role === 'user' && documents && documents.length > 0) {
+      const blocks: ContentBlock[] = [
+        { type: 'text', text: typeof msg.content === 'string' ? msg.content : '' },
+        ...documents.map((doc) => ({
+          type: 'document' as const,
+          source: { type: 'file' as const, file_id: doc.file_id },
+          title: doc.title,
+        })),
+      ];
+      return { role: msg.role, content: blocks };
+    }
+    return msg;
+  });
+
+  // Build request headers — include files beta header if documents are attached
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'x-api-key': anthropicApiKey,
+    'anthropic-version': ANTHROPIC_VERSION,
+  };
+  if (documents && documents.length > 0) {
+    headers['anthropic-beta'] = FILES_BETA;
+  }
+
   const body: Record<string, unknown> = {
     model: 'claude-sonnet-4-20250514',
     max_tokens: maxTokens,
-    messages,
+    messages: apiMessages,
   };
   if (systemPrompt) {
     body.system = systemPrompt;
@@ -44,11 +89,7 @@ export default async function (payload: ChatPayload) {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   const fetchOptions: RequestInit = {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': anthropicApiKey,
-      'anthropic-version': ANTHROPIC_VERSION,
-    },
+    headers,
     body: JSON.stringify(body),
   };
 

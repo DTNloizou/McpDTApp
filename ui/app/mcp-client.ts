@@ -4,6 +4,7 @@ import { publicClient as davisCopilotClient } from '@dynatrace-sdk/client-davis-
 import type { ConversationResponse } from '@dynatrace-sdk/client-davis-copilot';
 import { documentsClient } from '@dynatrace-sdk/client-document';
 import { loadConfig } from './config';
+import { getDocumentFileRefs } from './knowledge-base';
 
 export interface ToolCall {
   tool: string;
@@ -354,6 +355,8 @@ export async function repairDqlWithClaude(brokenDql: string, errorMsg: string): 
   const config = loadConfig();
   if (!config.claudeEnabled || !config.claudeApiKey) return null;
   try {
+    // Include uploaded KB documents so Claude has DQL reference context
+    const documentRefs = getDocumentFileRefs();
     const res = await functions.call('anthropic-chat', {
       data: {
         anthropicApiKey: config.claudeApiKey,
@@ -375,8 +378,9 @@ export async function repairDqlWithClaude(brokenDql: string, errorMsg: string): 
           `- sort by alias name when using bin(): sort time — NOT sort timestamp`,
           `- Use toDouble() for string-to-number conversions`,
         ].join('\n') }],
-        systemPrompt: 'You are a Dynatrace DQL syntax expert. Return ONLY the corrected DQL query, no explanation.',
+        systemPrompt: 'You are a Dynatrace DQL syntax expert. Use the reference documents for DQL syntax patterns. Return ONLY the corrected DQL query, no explanation.',
         maxTokens: 1024,
+        documents: documentRefs.length > 0 ? documentRefs : undefined,
       },
     });
     const result = await res.json() as { status: string; response?: string };
@@ -492,6 +496,7 @@ export async function getClaudeRecommendations(
         messages: [{ role: 'user', content: userMessage }],
         systemPrompt,
         maxTokens: 4096,
+        documents: getDocumentFileRefs(),
       },
     });
 
@@ -523,39 +528,28 @@ export async function createNotebook(
   title: string,
   sections: NotebookSection[]
 ): Promise<{ status: string; notebookId?: string; message?: string }> {
-  // Build the notebook JSON content following the Dynatrace notebook schema
-  const cells = sections.map((section, idx) => {
-    if (section.type === 'dql') {
-      return {
-        id: `cell-${idx}`,
-        type: 'code' as const,
-        language: 'dql',
-        content: section.content,
-      };
-    }
-    return {
-      id: `cell-${idx}`,
-      type: 'markdown' as const,
-      content: section.content,
-    };
-  });
-
+  // Build notebook content using Dynatrace notebook schema v7
+  // (matches the format used by the official Dynatrace MCP server)
   const notebookContent = JSON.stringify({
-    version: '1',
-    defaultTimeframe: { from: 'now()-2h', to: 'now()' },
-    sections: cells.map((cell) => ({
-      id: cell.id,
-      type: cell.type === 'code' ? 'dqlQuery' : 'markdown',
-      ...(cell.type === 'code'
-        ? {
-            state: { input: { value: cell.content } },
-            davisAnalysis: { analyzerComponentState: { resultState: {} } },
-            visualization: 'table',
-            visualizationSettings: {},
-            querySettings: { maxResultRecords: 1000 },
-          }
-        : { content: cell.content }),
-    })),
+    version: '7',
+    sections: sections.map((section, idx) => {
+      const id = `cell-${idx}-${Date.now().toString(36)}`;
+      if (section.type === 'dql') {
+        return {
+          id,
+          type: 'dql',
+          showTitle: false,
+          state: {
+            input: { value: section.content },
+          },
+        };
+      }
+      return {
+        id,
+        type: 'markdown',
+        markdown: section.content,
+      };
+    }),
   });
 
   try {
@@ -569,7 +563,22 @@ export async function createNotebook(
 
     return { status: 'success', notebookId: result.id };
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'Failed to create notebook';
+    // Capture detailed error info for debugging production issues
+    let msg = 'Failed to create notebook';
+    if (err instanceof Error) {
+      msg = err.message;
+      // Check for API error details
+      const anyErr = err as { cause?: { message?: string }; response?: { status?: number; statusText?: string } };
+      if (anyErr.cause?.message) {
+        msg += ` (${anyErr.cause.message})`;
+      }
+      if (anyErr.response) {
+        msg += ` [HTTP ${anyErr.response.status}: ${anyErr.response.statusText}]`;
+      }
+    } else if (typeof err === 'object' && err !== null) {
+      msg = JSON.stringify(err).slice(0, 300);
+    }
+    console.error('Notebook creation error:', err);
     return { status: 'error', message: msg };
   }
 }

@@ -2,7 +2,7 @@
   "environmentUrl": "https://zef6234h.sprint.apps.dynatracelabs.com/",
   "app": {
     "name": "MCP DT App",
-    "version": "1.3.4",
+    "version": "1.3.22",
     "description": "Query remote MCP servers from within Dynatrace",
     "id": "my.mcp.dt.app",
     "scopes": [

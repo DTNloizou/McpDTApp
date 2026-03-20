@@ -6,6 +6,7 @@ import {
   deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus,
   type KBDocument, type FileSyncStatus,
 } from '../knowledge-base';
+import { autoPopulateKB, type PopulateProgress } from '../kb-auto-populate';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -28,6 +29,9 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   const [kbDocs, setKbDocs] = useState<KBDocument[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [syncMessage, setSyncMessage] = useState('');
+  const [populating, setPopulating] = useState(false);
+  const [populateProgress, setPopulateProgress] = useState<PopulateProgress | null>(null);
+  const [populateMessage, setPopulateMessage] = useState('');
 
   useEffect(() => {
     if (open) {
@@ -43,6 +47,8 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
       setStatus('idle');
       setStatusMessage('');
       setSyncMessage('');
+      setPopulateMessage('');
+      setPopulateProgress(null);
       loadKBDocuments().then((docs) => setKbDocs(docs));
     }
   }, [open]);
@@ -434,6 +440,77 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
               marginBottom: 8,
             }}>
               {syncMessage}
+            </div>
+          )}
+
+          {/* Auto-populate button */}
+          {kbDocs.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <button
+                onClick={async () => {
+                  setPopulating(true);
+                  setPopulateMessage('');
+                  setPopulateProgress(null);
+                  try {
+                    const result = await autoPopulateKB((progress) => {
+                      setPopulateProgress({ ...progress });
+                    });
+                    setKbDocs(getKBDocuments());
+                    const parts: string[] = [];
+                    if (result.updated.length) parts.push(`${result.updated.length} docs updated`);
+                    if (result.errors.length) parts.push(`${result.errors.length} warnings`);
+                    setPopulateMessage(`✓ ${parts.join(', ') || 'Complete — no changes needed'}`);
+                  } catch (err: unknown) {
+                    setPopulateMessage(`✕ ${err instanceof Error ? err.message : 'Auto-populate failed'}`);
+                  } finally {
+                    setPopulating(false);
+                    setPopulateProgress(null);
+                  }
+                }}
+                disabled={populating}
+                style={{
+                  ...btnSecondaryStyle(populating),
+                  fontSize: 12,
+                  padding: '7px 12px',
+                  background: populating ? undefined : 'rgba(0,168,107,0.08)',
+                  borderColor: '#00a86b',
+                  color: populating ? undefined : '#00782A',
+                }}
+                title="Run DQL queries to auto-populate reference docs — no AI needed"
+              >
+                {populating ? '↻ Populating...' : '⚡ Auto-Populate with DQL'}
+              </button>
+              {populateProgress && (
+                <div style={{ marginTop: 6 }}>
+                  <div style={{
+                    height: 4,
+                    borderRadius: 2,
+                    background: 'var(--dt-colors-border-neutral-default, #e0e0e0)',
+                    overflow: 'hidden',
+                  }}>
+                    <div style={{
+                      height: '100%',
+                      width: `${populateProgress.pct}%`,
+                      background: '#00a86b',
+                      borderRadius: 2,
+                      transition: 'width 0.3s',
+                    }} />
+                  </div>
+                  <div style={{ fontSize: 11, color: '#666', marginTop: 3 }}>
+                    {populateProgress.phase}: {populateProgress.detail}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {populateMessage && (
+            <div style={{
+              fontSize: 12,
+              color: populateMessage.startsWith('✓') ? '#00a86b' : populateMessage.startsWith('✕') ? '#c62828' : '#666',
+              marginBottom: 8,
+            }}>
+              {populateMessage}
             </div>
           )}
 
