@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { loadConfig, saveConfig, AGENT_OPTIONS, AI_MODE_OPTIONS, type McpConfig, type AgentType, type AIMode } from '../config';
+import { loadConfig, saveConfig, AGENT_OPTIONS, AI_MODE_OPTIONS, LLM_PROVIDER_OPTIONS, GITHUB_MODEL_OPTIONS, type McpConfig, type AgentType, type AIMode, type LLMProvider } from '../config';
 import { testConnection, testDavisConnection, listTools, type McpTool } from '../mcp-client';
 import {
   getKBDocuments, addKBDocument, removeKBDocument, loadKBDocuments,
@@ -22,6 +22,9 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   const [agentApiKey, setAgentApiKey] = useState('');
   const [claudeEnabled, setClaudeEnabled] = useState(false);
   const [claudeApiKey, setClaudeApiKey] = useState('');
+  const [llmProvider, setLlmProvider] = useState<LLMProvider>('github-models');
+  const [githubPat, setGithubPat] = useState('');
+  const [githubModel, setGithubModel] = useState('claude-sonnet-4-20250514');
   const [status, setStatus] = useState<'idle' | 'testing' | 'connected' | 'error'>('idle');
   const [statusMessage, setStatusMessage] = useState('');
   const [tools, setTools] = useState<McpTool[]>([]);
@@ -43,6 +46,9 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
       setAgentApiKey(config.agent.apiKey);
       setClaudeEnabled(config.claudeEnabled);
       setClaudeApiKey(config.claudeApiKey);
+      setLlmProvider(config.llmProvider);
+      setGithubPat(config.githubPat);
+      setGithubModel(config.githubModel);
       setSaved(false);
       setStatus('idle');
       setStatusMessage('');
@@ -62,6 +68,9 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
     agent: { type: agentType, apiKey: agentApiKey },
     claudeEnabled,
     claudeApiKey,
+    llmProvider,
+    githubPat,
+    githubModel,
   });
 
   const handleSave = () => {
@@ -582,66 +591,103 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
 
           <Divider />
 
-          {/* Claude Integration — separate from AI Provider */}
-          <SectionHeader title="Claude Integration" />
-          <div style={{
-            padding: '14px 16px',
-            borderRadius: 10,
-            border: `2px solid ${claudeEnabled ? '#D97706' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
-            background: claudeEnabled ? 'rgba(217,119,6,0.06)' : 'var(--dt-colors-background-surface-default, #f8f8fb)',
-            marginBottom: 16,
-            transition: 'all 0.15s',
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: claudeEnabled ? 12 : 0 }}>
+          {/* LLM Provider — replaces old Claude Integration */}
+          <SectionHeader title="LLM Provider" />
+          <FieldHint>
+            Powers &quot;Ask Claude&quot; deep analysis and DQL repair. KB documents are included as context automatically.
+          </FieldHint>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, margin: '12px 0 16px' }}>
+            {LLM_PROVIDER_OPTIONS.map((opt) => (
               <button
-                onClick={() => setClaudeEnabled(!claudeEnabled)}
+                key={opt.value}
+                onClick={() => setLlmProvider(opt.value)}
                 style={{
-                  width: 40,
-                  height: 22,
-                  borderRadius: 11,
-                  border: 'none',
-                  background: claudeEnabled ? '#D97706' : '#ccc',
+                  padding: '14px 16px',
+                  borderRadius: 10,
+                  border: `2px solid ${llmProvider === opt.value ? '#6950A1' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
+                  background: llmProvider === opt.value
+                    ? 'rgba(105,80,161,0.06)'
+                    : 'var(--dt-colors-background-surface-default, #f8f8fb)',
                   cursor: 'pointer',
-                  position: 'relative',
-                  transition: 'background 0.2s',
-                  flexShrink: 0,
+                  textAlign: 'left',
+                  transition: 'all 0.15s',
                 }}
               >
-                <div style={{
-                  width: 18,
-                  height: 18,
-                  borderRadius: '50%',
-                  background: '#fff',
-                  position: 'absolute',
-                  top: 2,
-                  left: claudeEnabled ? 20 : 2,
-                  transition: 'left 0.2s',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-                }} />
-              </button>
-              <div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)' }}>
-                  🧠 Enable Claude
+                <div style={{ fontSize: 22, marginBottom: 6 }}>{opt.emoji}</div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
+                  {opt.label}
                 </div>
                 <div style={{ fontSize: 11, color: '#999', lineHeight: 1.4 }}>
-                  Adds "Ask Claude" option — uses Davis context + Claude for deeper analysis
+                  {opt.description}
                 </div>
-              </div>
-            </div>
+                {llmProvider === opt.value && (
+                  <div style={{ marginTop: 6, fontSize: 11, fontWeight: 600, color: '#6950A1' }}>
+                    ✓ Selected
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
 
-            {claudeEnabled && (
+          {llmProvider === 'github-models' && (
+            <div style={{
+              padding: '14px 16px',
+              borderRadius: 10,
+              border: '1px solid rgba(105,80,161,0.25)',
+              background: 'rgba(105,80,161,0.04)',
+              marginBottom: 16,
+            }}>
+              <FieldGroup label="GitHub Personal Access Token">
+                <input
+                  type="password"
+                  value={githubPat}
+                  onChange={(e) => setGithubPat(e.target.value)}
+                  placeholder="ghp_... or github_pat_..."
+                  style={inputStyle}
+                />
+                <FieldHint>
+                  A GitHub PAT with Copilot access. Go to github.com → Settings → Developer settings → Personal access tokens.
+                </FieldHint>
+              </FieldGroup>
+
+              <FieldGroup label="Model">
+                <select
+                  value={githubModel}
+                  onChange={(e) => setGithubModel(e.target.value)}
+                  style={inputStyle}
+                >
+                  {GITHUB_MODEL_OPTIONS.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label} ({m.provider})
+                    </option>
+                  ))}
+                </select>
+                <FieldHint>Choose any model available through GitHub Models / Copilot.</FieldHint>
+              </FieldGroup>
+            </div>
+          )}
+
+          {llmProvider === 'anthropic' && (
+            <div style={{
+              padding: '14px 16px',
+              borderRadius: 10,
+              border: '1px solid rgba(217,119,6,0.25)',
+              background: 'rgba(217,119,6,0.04)',
+              marginBottom: 16,
+            }}>
               <FieldGroup label="Anthropic API Key">
                 <input
                   type="password"
                   value={claudeApiKey}
-                  onChange={(e) => setClaudeApiKey(e.target.value)}
+                  onChange={(e) => { setClaudeApiKey(e.target.value); setClaudeEnabled(!!e.target.value); }}
                   placeholder="sk-ant-..."
                   style={inputStyle}
                 />
                 <FieldHint>Your Anthropic API key. Davis gathers context first, then Claude provides deeper analysis.</FieldHint>
               </FieldGroup>
-            )}
-          </div>
+            </div>
+          )}
         </div>
 
         {/* Footer */}

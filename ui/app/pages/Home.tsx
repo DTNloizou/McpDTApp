@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, forwardRef } from 'react';
 import { Flex } from '@dynatrace/strato-components/layouts';
 import { TitleBar } from '@dynatrace/strato-components-preview/layouts';
-import { sendChat, testConnection, testDavisConnection, executeDql, getRecommendations, getClaudeRecommendations, repairDqlWithClaude, createNotebook, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
+import { sendChat, testConnection, testDavisConnection, executeDql, getRecommendations, getClaudeRecommendations, repairDqlWithClaude, isLLMConfigured, createNotebook, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
 import { getEnvironmentUrl } from '@dynatrace-sdk/app-environment';
-import { loadConfig } from '../config';
+import { loadConfig, GITHUB_MODEL_OPTIONS } from '../config';
 import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
 import { loadCustomCategories, getCustomCategories, saveCustomCategories, type CustomCategory, type CustomQuery } from '../custom-queries';
 import { autoPopulateKB, type PopulateProgress } from '../kb-auto-populate';
@@ -412,9 +412,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
 
       if (config.aiMode === 'dynatrace-assist') {
         // Build notebook directly using the Document SDK
-        const recoText = recommendation.content.slice(0, 5000);
+        const recoText = recommendation.content;
 
-        // Clean the recommendation text:
+        // Clean the recommendation text first (before any truncation):
         // 1. Strip XML tags from Davis CoPilot responses
         // 2. Remove inlined query execution results (from enrichRecommendationContent)
         // 3. Remove CUSTOM_INFO MCP blocks and raw JSON result dumps
@@ -1412,29 +1412,34 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 const totalDocs = kbDocs.length;
                 const syncedDocs = kbDocs.filter((d) => getDocSyncStatus(d.name) === 'synced').length;
                 const config = loadConfig();
+                const usingGitHub = config.llmProvider === 'github-models';
                 const anthropicKey = config.claudeApiKey || config.agent?.apiKey || '';
-                const hasApiKey = !!anthropicKey;
-                const allSynced = syncedDocs === totalDocs && totalDocs > 0;
-                const hasPending = syncedDocs < totalDocs;
+                const hasApiKey = usingGitHub ? !!config.githubPat : !!anthropicKey;
+                const allSynced = usingGitHub ? true : (syncedDocs === totalDocs && totalDocs > 0);
+                const hasPending = usingGitHub ? false : (syncedDocs < totalDocs);
 
                 return (
                 <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(0,168,107,0.08) 0%, rgba(0,152,212,0.08) 100%)', border: '1px solid ' + (allSynced ? 'rgba(0,168,107,0.3)' : 'rgba(0,152,212,0.25)') }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
-                        {allSynced
-                          ? `✅ All ${totalDocs} document${totalDocs === 1 ? '' : 's'} synced to Claude`
-                          : `☁️ ${syncedDocs}/${totalDocs} document${totalDocs === 1 ? '' : 's'} synced`}
+                        {usingGitHub
+                          ? `✅ ${totalDocs} document${totalDocs === 1 ? '' : 's'} — inlined automatically via GitHub Models`
+                          : allSynced
+                            ? `✅ All ${totalDocs} document${totalDocs === 1 ? '' : 's'} synced to Claude`
+                            : `☁️ ${syncedDocs}/${totalDocs} document${totalDocs === 1 ? '' : 's'} synced`}
                       </div>
                       <div style={{ fontSize: 11, color: '#888' }}>
-                        {!hasApiKey
-                          ? 'Set your Anthropic API key in Settings to enable file syncing.'
-                          : allSynced
-                            ? 'All documents are uploaded to Anthropic and referenced by file_id in conversations.'
-                            : `${totalDocs - syncedDocs} document${totalDocs - syncedDocs === 1 ? '' : 's'} pending upload. Click Sync to upload now.`}
+                        {usingGitHub
+                          ? 'KB documents are included as context in prompts — no file upload needed.'
+                          : !hasApiKey
+                            ? 'Set your Anthropic API key in Settings to enable file syncing.'
+                            : allSynced
+                              ? 'All documents are uploaded to Anthropic and referenced by file_id in conversations.'
+                              : `${totalDocs - syncedDocs} document${totalDocs - syncedDocs === 1 ? '' : 's'} pending upload. Click Sync to upload now.`}
                       </div>
                     </div>
-                    {hasApiKey && hasPending && (
+                    {!usingGitHub && hasApiKey && hasPending && (
                       <button
                         onClick={async () => {
                           if (!anthropicKey) return;
@@ -2265,19 +2270,25 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                   >
                     🤖 Get AI Recommendations
                   </button>
-                  {loadConfig().claudeEnabled && (
-                    <button
-                      onClick={handleAskClaude}
-                      style={{ ...recoBtnStyle, background: 'linear-gradient(135deg, #D97706 0%, #F59E0B 100%)' }}
-                    >
-                      🧠 Ask Claude
-                    </button>
-                  )}
+                  {isLLMConfigured() && (() => {
+                    const cfg = loadConfig();
+                    const modelLabel = cfg.llmProvider === 'github-models'
+                      ? (GITHUB_MODEL_OPTIONS.find((m) => m.id === cfg.githubModel)?.label || cfg.githubModel)
+                      : 'Claude';
+                    return (
+                      <button
+                        onClick={handleAskClaude}
+                        style={{ ...recoBtnStyle, background: 'linear-gradient(135deg, #D97706 0%, #F59E0B 100%)' }}
+                      >
+                        🧠 Ask {modelLabel}
+                      </button>
+                    );
+                  })()}
                 </div>
                 <div style={{ fontSize: 11, color: '#999', maxWidth: 360, lineHeight: 1.5 }}>
-                  {loadConfig().claudeEnabled
-                    ? 'AI Recommendations uses Davis CoPilot. Ask Claude gets Davis context first, then sends to Claude for deeper analysis.'
-                    : 'Enable Claude in Settings to add deeper AI analysis powered by Anthropic.'}
+                  {isLLMConfigured()
+                    ? `AI Recommendations uses Davis CoPilot. The other button gets Davis context first, then sends to ${loadConfig().llmProvider === 'github-models' ? (GITHUB_MODEL_OPTIONS.find((m) => m.id === loadConfig().githubModel)?.label || 'your model') : 'Claude'} for deeper analysis.`
+                    : 'Configure an LLM provider in Settings to add deeper AI analysis.'}
                 </div>
               </div>
             )}

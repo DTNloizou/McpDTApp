@@ -4,7 +4,7 @@ import { publicClient as davisCopilotClient } from '@dynatrace-sdk/client-davis-
 import type { ConversationResponse } from '@dynatrace-sdk/client-davis-copilot';
 import { documentsClient } from '@dynatrace-sdk/client-document';
 import { loadConfig } from './config';
-import { getDocumentFileRefs } from './knowledge-base';
+import { getDocumentFileRefs, buildKBContext, buildKBSummary } from './knowledge-base';
 
 export interface ToolCall {
   tool: string;
@@ -348,42 +348,109 @@ export async function getRecommendations(
 }
 
 /**
+ * Unified LLM call helper — routes to GitHub Models or Anthropic based on config.
+ * Accepts OpenAI-style messages (system/user/assistant).
+ * KB documents are inlined into the system prompt for GitHub Models,
+ * or passed as file refs for Anthropic.
+ */
+async function callLLM(
+  userMessages: { role: 'user' | 'assistant'; content: string }[],
+  systemPrompt?: string,
+  maxTokens = 4096,
+  /** When true, callLLM will NOT inject KB context — the caller already included it */
+  skipKB = false,
+): Promise<{ status: string; response: string; usage?: { input_tokens: number; output_tokens: number }; message?: string }> {
+  const config = loadConfig();
+
+  if (config.llmProvider === 'github-models') {
+    if (!config.githubPat) {
+      return { status: 'error', response: '', message: 'GitHub PAT not configured. Add it in Settings.' };
+    }
+
+    // Use condensed KB summary for GitHub Models (free tier has 8K token input limit)
+    // Skip if caller already embedded KB context in the system prompt
+    const kbContext = skipKB ? '' : buildKBSummary();
+    const fullSystem = [systemPrompt, kbContext].filter(Boolean).join('\n\n');
+
+    const messages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [];
+    if (fullSystem) {
+      messages.push({ role: 'system', content: fullSystem });
+    }
+    messages.push(...userMessages);
+
+    // Cap maxTokens to stay within GitHub Models free-tier output limit (4096)
+    const cappedMaxTokens = Math.min(maxTokens, 4096);
+
+    const res = await functions.call('github-chat', {
+      data: {
+        githubPat: config.githubPat,
+        model: config.githubModel || 'openai/gpt-4.1',
+        messages,
+        maxTokens: cappedMaxTokens,
+      },
+    });
+    return await res.json() as { status: string; response: string; usage?: { input_tokens: number; output_tokens: number }; message?: string };
+  }
+
+  // Anthropic path (legacy)
+  const anthropicApiKey = config.claudeApiKey;
+  if (!anthropicApiKey) {
+    return { status: 'error', response: '', message: 'Anthropic API key not configured. Enable Claude in Settings and add your API key.' };
+  }
+
+  const documentRefs = getDocumentFileRefs();
+  const res = await functions.call('anthropic-chat', {
+    data: {
+      anthropicApiKey,
+      messages: userMessages,
+      systemPrompt,
+      maxTokens,
+      documents: documentRefs.length > 0 ? documentRefs : undefined,
+    },
+  });
+  return await res.json() as { status: string; response: string; usage?: { input_tokens: number; output_tokens: number }; message?: string };
+}
+
+/**
+ * Check whether an LLM provider is configured and ready to use.
+ */
+export function isLLMConfigured(): boolean {
+  const config = loadConfig();
+  if (config.llmProvider === 'github-models') return !!config.githubPat;
+  return config.claudeEnabled && !!config.claudeApiKey;
+}
+
+/**
  * Ask Claude to repair a broken DQL query using the parse error message.
  * Returns the corrected query string, or null if repair isn't possible.
  */
 export async function repairDqlWithClaude(brokenDql: string, errorMsg: string): Promise<string | null> {
-  const config = loadConfig();
-  if (!config.claudeEnabled || !config.claudeApiKey) return null;
+  if (!isLLMConfigured()) return null;
   try {
-    // Include uploaded KB documents so Claude has DQL reference context
-    const documentRefs = getDocumentFileRefs();
-    const res = await functions.call('anthropic-chat', {
-      data: {
-        anthropicApiKey: config.claudeApiKey,
-        messages: [{ role: 'user' as const, content: [
-          `This DQL query failed with a parse error. Fix it and return ONLY the corrected DQL query, nothing else — no explanation, no markdown, just the raw query.`,
-          ``,
-          `**Broken query:**`,
-          brokenDql,
-          ``,
-          `**Error:**`,
-          errorMsg.slice(0, 500),
-          ``,
-          `DQL RULES:`,
-            `- contains() is a FUNCTION: contains(fieldName, "value") — NOT fieldName contains "value"`,
-          `- Group-by: summarize count(), by:{fieldName}`,
-          `- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)} — ALWAYS alias bin()`,
-          `- Math: round(value, decimals:2) — NOT round(value, 2)`,
-          `- Multiplication needs explicit *: (a / b) * 100 — NOT (a / b) 100`,
-          `- sort by alias name when using bin(): sort time — NOT sort timestamp`,
-          `- Use toDouble() for string-to-number conversions`,
-        ].join('\n') }],
-        systemPrompt: 'You are a Dynatrace DQL syntax expert. Use the reference documents for DQL syntax patterns. Return ONLY the corrected DQL query, no explanation.',
-        maxTokens: 1024,
-        documents: documentRefs.length > 0 ? documentRefs : undefined,
-      },
-    });
-    const result = await res.json() as { status: string; response?: string };
+    const userContent = [
+      `This DQL query failed with a parse error. Fix it and return ONLY the corrected DQL query, nothing else — no explanation, no markdown, just the raw query.`,
+      ``,
+      `**Broken query:**`,
+      brokenDql,
+      ``,
+      `**Error:**`,
+      errorMsg.slice(0, 500),
+      ``,
+      `DQL RULES:`,
+      `- contains() is a FUNCTION: contains(fieldName, "value") — NOT fieldName contains "value"`,
+      `- Group-by: summarize count(), by:{fieldName}`,
+      `- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)} — ALWAYS alias bin()`,
+      `- Math: round(value, decimals:2) — NOT round(value, 2)`,
+      `- Multiplication needs explicit *: (a / b) * 100 — NOT (a / b) 100`,
+      `- sort by alias name when using bin(): sort time — NOT sort timestamp`,
+      `- Use toDouble() for string-to-number conversions`,
+    ].join('\n');
+
+    const result = await callLLM(
+      [{ role: 'user', content: userContent }],
+      'You are a Dynatrace DQL syntax expert. Use the reference documents for DQL syntax patterns. Return ONLY the corrected DQL query, no explanation.',
+      1024,
+    );
     if (result.status === 'success' && result.response) {
       let repaired = result.response.trim();
       repaired = repaired.replace(/^```(?:dql|sql)?\s*\n?/m, '').replace(/\n?```\s*$/m, '').trim();
@@ -396,9 +463,9 @@ export async function repairDqlWithClaude(brokenDql: string, errorMsg: string): 
 }
 
 /**
- * Ask Claude directly (via in-app serverless function) with Davis CoPilot context.
- * Flow: Davis analyses first → Claude gets Davis context + raw data → deep analysis.
- * No external MCP proxy needed.
+ * Ask the LLM directly (via in-app serverless function) with Davis CoPilot context.
+ * Flow: Davis analyses first → LLM gets Davis context + raw data → deep analysis.
+ * Routes to GitHub Models or Anthropic based on config.llmProvider.
  */
 export async function getClaudeRecommendations(
   queryLabel: string,
@@ -406,15 +473,20 @@ export async function getClaudeRecommendations(
   queryResults: string,
   kbContext?: string,
 ): Promise<ChatResponse> {
-  const config = loadConfig();
-  const anthropicApiKey = config.claudeApiKey;
-
-  if (!anthropicApiKey) {
-    return { status: 'error', response: '', message: 'Anthropic API key not configured. Enable Claude in Settings and add your API key.' };
+  if (!isLLMConfigured()) {
+    return { status: 'error', response: '', message: 'No LLM configured. Add a GitHub PAT or Anthropic API key in Settings.' };
   }
 
-  const trimmedResults = queryResults.length > 8000
-    ? queryResults.slice(0, 8000) + '\n\n… (results truncated for brevity)'
+  const config = loadConfig();
+  // For GitHub Models (8K token limit), use condensed KB summary instead of full text
+  const effectiveKB = (kbContext && config.llmProvider === 'github-models')
+    ? buildKBSummary()
+    : kbContext;
+
+  // For GitHub Models (8K input token limit), cap results more aggressively
+  const maxResults = config.llmProvider === 'github-models' ? 3000 : 8000;
+  const trimmedResults = queryResults.length > maxResults
+    ? queryResults.slice(0, maxResults) + '\n\n… (results truncated for brevity)'
     : queryResults;
 
   // Step 1: Get Davis CoPilot context
@@ -437,11 +509,11 @@ export async function getClaudeRecommendations(
     // Davis context is optional — continue without it
   }
 
-  // Step 2: Send to Claude with Davis context
+  // Step 2: Send to LLM with Davis context
   const systemPrompt = [
     `You are a Dynatrace SRE expert. You have been given query results from Dynatrace and contextual analysis from Davis CoPilot (Dynatrace's built-in AI).`,
     `Provide a deep, actionable analysis that builds on Davis's insights.`,
-    ...(kbContext ? [
+    ...(effectiveKB ? [
       ``,
       `IMPORTANT: The user has provided reference documents below. Study them carefully for:`,
       `- DQL query syntax and patterns (use these as templates for any queries you suggest)`,
@@ -450,7 +522,7 @@ export async function getClaudeRecommendations(
       ``,
       `When suggesting DQL queries, match the syntax patterns found in these documents exactly.`,
       ``,
-      kbContext,
+      effectiveKB,
     ] : []),
   ].join('\n');
 
@@ -490,24 +562,19 @@ export async function getClaudeRecommendations(
   ].join('\n');
 
   try {
-    const res = await functions.call('anthropic-chat', {
-      data: {
-        anthropicApiKey,
-        messages: [{ role: 'user', content: userMessage }],
-        systemPrompt,
-        maxTokens: 4096,
-        documents: getDocumentFileRefs(),
-      },
-    });
-
-    const result = await res.json() as { status: string; response?: string; message?: string; usage?: { input_tokens: number; output_tokens: number } };
+    const result = await callLLM(
+      [{ role: 'user', content: userMessage }],
+      systemPrompt,
+      4096,
+      true, // KB already included in systemPrompt
+    );
 
     if (result.status === 'success') {
       return { status: 'success', response: result.response || '', usage: result.usage };
     }
-    return { status: 'error', response: '', message: result.message || 'Claude request failed' };
+    return { status: 'error', response: '', message: result.message || 'LLM request failed' };
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'Unknown error calling Claude';
+    const msg = err instanceof Error ? err.message : 'Unknown error calling LLM';
     return { status: 'error', response: '', message: msg };
   }
 }
