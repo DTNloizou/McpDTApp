@@ -5,12 +5,29 @@
  * Dynatrace JavaScript Runtime.  Users authenticate with a GitHub PAT
  * that has Copilot access — no separate AI billing required.
  *
- * Supports any model served by GitHub Models: GPT-4o, Claude, Gemini, etc.
+ * Supports tool-calling for agentic workflows (execute DQL, etc.)
  */
 
 interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
-  content: string;
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+}
+
+interface ToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+interface ToolDef {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
 }
 
 interface ChatPayload {
@@ -18,12 +35,13 @@ interface ChatPayload {
   model: string;
   messages: ChatMessage[];
   maxTokens?: number;
+  tools?: ToolDef[];
 }
 
 const API_URL = 'https://models.github.ai/inference/chat/completions';
 
 export default async function (payload: ChatPayload) {
-  const { githubPat, model, messages, maxTokens = 4096 } = payload;
+  const { githubPat, model, messages, maxTokens = 4096, tools } = payload;
 
   if (!githubPat) {
     return { status: 'error', message: 'GitHub PAT is required' };
@@ -42,11 +60,14 @@ export default async function (payload: ChatPayload) {
     'X-GitHub-Api-Version': '2022-11-28',
   };
 
-  const body = {
+  const body: Record<string, unknown> = {
     model,
     messages,
     max_tokens: maxTokens,
   };
+  if (tools && tools.length > 0) {
+    body.tools = tools;
+  }
 
   // 55-second timeout — fail before nginx 504
   let timeout: ReturnType<typeof setTimeout> | undefined;
@@ -88,10 +109,14 @@ export default async function (payload: ChatPayload) {
     // OpenAI-compatible response format
     const choice = data.choices?.[0];
     const text = choice?.message?.content || '';
+    const toolCalls = choice?.message?.tool_calls || undefined;
+    const finishReason = choice?.finish_reason || 'stop';
 
     return {
       status: 'success',
       response: text,
+      toolCalls,
+      finishReason,
       usage: data.usage ? {
         input_tokens: data.usage.prompt_tokens,
         output_tokens: data.usage.completion_tokens,

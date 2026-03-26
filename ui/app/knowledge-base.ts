@@ -2,6 +2,10 @@
  * Knowledge base for uploaded .md documents.
  * Persisted via the Dynatrace App State API so documents survive page reloads.
  * An in-memory cache avoids repeated API calls within the same session.
+ *
+ * Includes a lightweight RAG vector store: KB docs are chunked and embedded
+ * via GitHub Models' embeddings endpoint.  At query time, only the most
+ * relevant chunks are injected into the prompt, keeping token usage low.
  */
 
 import { stateClient } from '@dynatrace-sdk/client-state';
@@ -12,6 +16,7 @@ const KB_MANIFEST_KEY = 'kb-manifest';
 const KB_PLACEHOLDERS_KEY = 'kb-placeholders';
 const KB_DISCOVERY_STATUS_KEY = 'kb-discovery-status';
 const KB_FILEIDS_KEY = 'kb-file-ids';
+const KB_VECTORS_KEY = 'kb-vectors';
 
 // Patterns we ignore when detecting placeholders (common markdown/code tokens)
 const IGNORED_TOKENS = new Set([
@@ -39,6 +44,21 @@ let fileIdMap: Record<string, string> = {};
 // content hash at upload time: docName → hash string
 let uploadedHashMap: Record<string, string> = {};
 let fileIdsLoaded = false;
+
+/* ─── RAG Vector Store ─── */
+
+export interface KBChunk {
+  docName: string;
+  section: string;    // markdown heading context
+  text: string;       // the chunk text
+  hash: string;       // content hash for change detection
+  embedding: number[];
+}
+
+// In-memory vector index
+let vectorIndex: KBChunk[] = [];
+let vectorsLoaded = false;
+let vectorsDirty = false; // true when in-memory index has unsaved changes
 
 /** Simple content hash for change detection. */
 function contentHash(content: string): string {
@@ -758,4 +778,260 @@ export async function loadDiscoveryStatus(): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+/* ─── RAG: Chunking, Embedding & Retrieval ─── */
+
+const CHUNK_SIZE = 600;    // ~600 chars ≈ ~150 tokens per chunk
+const CHUNK_OVERLAP = 100; // overlap for context continuity
+
+/**
+ * Split a document into chunks by markdown sections, then by size.
+ * Each chunk carries the doc name and current section heading.
+ */
+function chunkDocument(docName: string, content: string): { text: string; section: string; hash: string }[] {
+  const lines = content.split('\n');
+  const chunks: { text: string; section: string; hash: string }[] = [];
+  let currentSection = docName;
+  let buffer = '';
+
+  const flush = () => {
+    const trimmed = buffer.trim();
+    if (trimmed.length > 20) { // skip tiny fragments
+      chunks.push({ text: trimmed, section: currentSection, hash: contentHash(trimmed) });
+    }
+    buffer = '';
+  };
+
+  for (const line of lines) {
+    const heading = line.match(/^#{1,4}\s+(.+)/);
+    if (heading) {
+      flush();
+      currentSection = heading[1].trim();
+    }
+
+    buffer += line + '\n';
+
+    if (buffer.length >= CHUNK_SIZE) {
+      // Push the full chunk
+      const trimmed = buffer.trim();
+      if (trimmed.length > 20) {
+        chunks.push({ text: trimmed, section: currentSection, hash: contentHash(trimmed) });
+      }
+      // Keep overlap tail for continuity
+      buffer = buffer.slice(-CHUNK_OVERLAP);
+    }
+  }
+  flush();
+  return chunks;
+}
+
+/** Cosine similarity between two vectors. */
+function cosineSim(a: number[], b: number[]): number {
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+/** Call the github-embeddings serverless function. */
+async function callEmbeddings(texts: string[], githubPat: string): Promise<number[][]> {
+  const res = await functions.call('github-embeddings', {
+    data: { githubPat, inputs: texts },
+  });
+  const result = await res.json() as { status: string; embeddings?: number[][]; message?: string };
+  if (result.status !== 'success' || !result.embeddings) {
+    throw new Error(result.message || 'Embeddings call failed');
+  }
+  return result.embeddings;
+}
+
+/** Load the persisted vector index from App State. */
+async function loadVectorIndex(): Promise<void> {
+  if (vectorsLoaded) return;
+  try {
+    const state = await stateClient.getAppState({ key: KB_VECTORS_KEY });
+    vectorIndex = JSON.parse(state.value) as KBChunk[];
+  } catch {
+    vectorIndex = [];
+  }
+  vectorsLoaded = true;
+}
+
+/** Persist the in-memory vector index to App State. */
+async function saveVectorIndex(): Promise<void> {
+  // App State has a ~400KB value limit — if we exceed it, drop oldest chunks
+  let json = JSON.stringify(vectorIndex);
+  while (json.length > 380000 && vectorIndex.length > 0) {
+    vectorIndex.splice(0, Math.ceil(vectorIndex.length * 0.1)); // drop 10%
+    json = JSON.stringify(vectorIndex);
+  }
+  await stateClient.setAppState({
+    key: KB_VECTORS_KEY,
+    body: { value: json },
+  });
+  vectorsDirty = false;
+}
+
+/**
+ * Index (embed) a single KB document. Diffs against existing chunks and
+ * only embeds new/changed ones to minimise API calls.
+ * Returns the number of new chunks embedded.
+ */
+export async function indexDocument(docName: string, content: string, githubPat: string): Promise<number> {
+  await loadVectorIndex();
+
+  const newChunks = chunkDocument(docName, content);
+  const existingHashes = new Set(
+    vectorIndex.filter((c) => c.docName === docName).map((c) => c.hash)
+  );
+
+  // Find chunks that need embedding (new or changed)
+  const toEmbed = newChunks.filter((c) => !existingHashes.has(c.hash));
+
+  // Remove old chunks for this doc that no longer exist
+  const newHashes = new Set(newChunks.map((c) => c.hash));
+  vectorIndex = vectorIndex.filter((c) => c.docName !== docName || newHashes.has(c.hash));
+
+  if (toEmbed.length === 0) return 0; // nothing changed
+
+  // Batch embed (GitHub Models supports batches up to ~2048 inputs)
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < toEmbed.length; i += BATCH_SIZE) {
+    const batch = toEmbed.slice(i, i + BATCH_SIZE);
+    const texts = batch.map((c) => `[${c.section}] ${c.text}`);
+    const embeddings = await callEmbeddings(texts, githubPat);
+
+    for (let j = 0; j < batch.length; j++) {
+      vectorIndex.push({
+        docName: batch[j].section ? docName : docName,
+        section: batch[j].section,
+        text: batch[j].text,
+        hash: batch[j].hash,
+        embedding: embeddings[j],
+      });
+    }
+  }
+
+  vectorsDirty = true;
+  await saveVectorIndex();
+  return toEmbed.length;
+}
+
+/**
+ * Index all KB documents. Typically called once at startup or after bulk changes.
+ * Returns { indexed, skipped, errors }.
+ */
+export async function indexAllDocuments(
+  githubPat: string,
+  onProgress?: (docName: string, status: 'indexing' | 'done' | 'skipped' | 'error') => void,
+): Promise<{ indexed: number; skipped: number; errors: string[] }> {
+  if (!loaded) await loadKBDocuments();
+  await loadVectorIndex();
+
+  let indexed = 0;
+  let skipped = 0;
+  const errors: string[] = [];
+
+  for (const doc of documents) {
+    onProgress?.(doc.name, 'indexing');
+    try {
+      const count = await indexDocument(doc.name, doc.content, githubPat);
+      if (count > 0) {
+        indexed += count;
+        onProgress?.(doc.name, 'done');
+      } else {
+        skipped++;
+        onProgress?.(doc.name, 'skipped');
+      }
+    } catch (err) {
+      errors.push(`${doc.name}: ${err instanceof Error ? err.message : 'Unknown error'}`);
+      onProgress?.(doc.name, 'error');
+    }
+  }
+
+  return { indexed, skipped, errors };
+}
+
+/**
+ * Remove all vector chunks for a given document (called when a doc is deleted).
+ */
+export async function removeDocumentVectors(docName: string): Promise<void> {
+  await loadVectorIndex();
+  const before = vectorIndex.length;
+  vectorIndex = vectorIndex.filter((c) => c.docName !== docName);
+  if (vectorIndex.length !== before) {
+    await saveVectorIndex();
+  }
+}
+
+/**
+ * Retrieve the most relevant KB chunks for a given query.
+ * Returns formatted context text ready for injection into a prompt.
+ *
+ * @param query - The user's question
+ * @param githubPat - PAT for the embeddings call
+ * @param topK - Number of top chunks to return (default 5)
+ * @param minScore - Minimum cosine similarity threshold (default 0.3)
+ */
+export async function retrieveRelevantKB(
+  query: string,
+  githubPat: string,
+  topK = 5,
+  minScore = 0.3,
+): Promise<string> {
+  await loadVectorIndex();
+
+  if (vectorIndex.length === 0) {
+    // No vectors — fall back to summary
+    return buildKBSummary();
+  }
+
+  // Embed the query
+  const [queryEmbedding] = await callEmbeddings([query], githubPat);
+
+  // Score all chunks
+  const scored = vectorIndex.map((chunk) => ({
+    chunk,
+    score: cosineSim(queryEmbedding, chunk.embedding),
+  }));
+
+  // Sort by score descending, take topK above threshold
+  scored.sort((a, b) => b.score - a.score);
+  const relevant = scored.filter((s) => s.score >= minScore).slice(0, topK);
+
+  if (relevant.length === 0) {
+    return buildKBSummary(); // fall back if nothing relevant
+  }
+
+  const parts = relevant.map((r) =>
+    `--- ${r.chunk.docName} > ${r.chunk.section} (relevance: ${(r.score * 100).toFixed(0)}%) ---\n${r.chunk.text}`
+  );
+
+  return [
+    `Relevant knowledge base excerpts for this query:`,
+    '',
+    ...parts,
+    '',
+    `--- End of KB context ---`,
+  ].join('\n');
+}
+
+/**
+ * Check if the vector index has any entries (i.e. KB has been indexed).
+ */
+export function isKBIndexed(): boolean {
+  return vectorIndex.length > 0;
+}
+
+/**
+ * Get stats about the current vector index.
+ */
+export function getVectorIndexStats(): { totalChunks: number; documents: string[] } {
+  const docs = [...new Set(vectorIndex.map((c) => c.docName))];
+  return { totalChunks: vectorIndex.length, documents: docs };
 }

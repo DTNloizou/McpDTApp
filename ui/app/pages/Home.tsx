@@ -4,7 +4,7 @@ import { TitleBar } from '@dynatrace/strato-components-preview/layouts';
 import { sendChat, testConnection, testDavisConnection, executeDql, getRecommendations, getClaudeRecommendations, repairDqlWithClaude, isLLMConfigured, createNotebook, type ToolCall, type DqlResult, type ChatResponse } from '../mcp-client';
 import { getEnvironmentUrl } from '@dynatrace-sdk/app-environment';
 import { loadConfig, GITHUB_MODEL_OPTIONS } from '../config';
-import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
+import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, indexAllDocuments, isKBIndexed, getVectorIndexStats, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
 import { loadCustomCategories, getCustomCategories, saveCustomCategories, type CustomCategory, type CustomQuery } from '../custom-queries';
 import { autoPopulateKB, type PopulateProgress } from '../kb-auto-populate';
 
@@ -211,6 +211,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   const [enrichingReco, setEnrichingReco] = useState(false);
   const [nlQuery, setNlQuery] = useState('');
   const [nlGenerating, setNlGenerating] = useState(false);
+  const [indexing, setIndexing] = useState(false);
+  const [indexStatus, setIndexStatus] = useState('');
+  const [indexingDoc, setIndexingDoc] = useState('');
 
   // Pre-built queries state
   const [customCategories, setCustomCategories] = useState<CustomCategory[]>([]);
@@ -1104,10 +1107,34 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         .filter((m) => m.role === 'user' || m.role === 'assistant')
         .slice(-10)
         .map((m) => ({ role: m.role, content: m.content }));
+
+      // Include last query results so the LLM has context for follow-ups
+      const queryContext = lastQuery
+        ? `\n\n[Recent query context]\nQuery: ${lastQuery.label}\nDQL: ${lastQuery.dql}\nResults (truncated):\n${lastQuery.results.slice(0, 2000)}`
+        : '';
+      const enrichedMsg = queryContext ? msg + queryContext : msg;
+
       const fileRefs = getDocumentFileRefs();
-      const result = await sendChat(msg, history, undefined, fileRefs.length > 0 ? fileRefs : undefined);
+      const result = await sendChat(enrichedMsg, history, undefined, fileRefs.length > 0 ? fileRefs : undefined, (tc) => {
+        // Show live tool call progress as a system message
+        const reason = tc.input.reason ? ` — ${tc.input.reason}` : '';
+        const query = tc.input.query || '';
+        setMessages((prev) => {
+          // Update the existing "thinking" message if present, otherwise add one
+          const last = prev[prev.length - 1];
+          const line = `🔧 ${tc.tool}: \`${query}\`${reason}`;
+          if (last && last.role === 'system' && last.content.startsWith('🔧')) {
+            return [...prev.slice(0, -1), { role: 'system' as const, content: last.content + '\n' + line }];
+          }
+          return [...prev, { role: 'system' as const, content: line }];
+        });
+      });
       if (result.status === 'success') {
-        setMessages((prev) => [...prev, { role: 'assistant', content: result.response, toolCalls: result.toolCalls }]);
+        // Remove the "thinking" system message and add the final response
+        setMessages((prev) => {
+          const cleaned = prev.filter((m) => !(m.role === 'system' && m.content.startsWith('🔧')));
+          return [...cleaned, { role: 'assistant', content: result.response, toolCalls: result.toolCalls }];
+        });
       } else {
         setMessages((prev) => [...prev, { role: 'error', content: result.message || 'Unknown error' }]);
       }
@@ -1417,6 +1444,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 const hasApiKey = usingGitHub ? !!config.githubPat : !!anthropicKey;
                 const allSynced = usingGitHub ? true : (syncedDocs === totalDocs && totalDocs > 0);
                 const hasPending = usingGitHub ? false : (syncedDocs < totalDocs);
+                const vectorStats = getVectorIndexStats();
+                const kbIsIndexed = isKBIndexed();
 
                 return (
                 <div style={{ marginTop: 16, padding: '16px 20px', borderRadius: 10, background: 'linear-gradient(135deg, rgba(0,168,107,0.08) 0%, rgba(0,152,212,0.08) 100%)', border: '1px solid ' + (allSynced ? 'rgba(0,168,107,0.3)' : 'rgba(0,152,212,0.25)') }}>
@@ -1424,21 +1453,62 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                     <div style={{ flex: 1 }}>
                       <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
                         {usingGitHub
-                          ? `✅ ${totalDocs} document${totalDocs === 1 ? '' : 's'} — inlined automatically via GitHub Models`
+                          ? kbIsIndexed
+                            ? `✅ ${totalDocs} doc${totalDocs === 1 ? '' : 's'} indexed — ${vectorStats.totalChunks} chunks in vector store`
+                            : `📄 ${totalDocs} document${totalDocs === 1 ? '' : 's'} — not yet indexed`
                           : allSynced
                             ? `✅ All ${totalDocs} document${totalDocs === 1 ? '' : 's'} synced to Claude`
                             : `☁️ ${syncedDocs}/${totalDocs} document${totalDocs === 1 ? '' : 's'} synced`}
                       </div>
                       <div style={{ fontSize: 11, color: '#888' }}>
                         {usingGitHub
-                          ? 'KB documents are included as context in prompts — no file upload needed.'
+                          ? kbIsIndexed
+                            ? 'KB documents are embedded and only relevant chunks are injected per query (RAG). Re-index after editing docs.'
+                            : 'Click Index to embed your KB documents. Only relevant chunks will be sent per query, saving tokens.'
                           : !hasApiKey
                             ? 'Set your Anthropic API key in Settings to enable file syncing.'
                             : allSynced
                               ? 'All documents are uploaded to Anthropic and referenced by file_id in conversations.'
                               : `${totalDocs - syncedDocs} document${totalDocs - syncedDocs === 1 ? '' : 's'} pending upload. Click Sync to upload now.`}
                       </div>
+                      {indexingDoc && <div style={{ fontSize: 10, color: '#6950a1', marginTop: 3 }}>Indexing: {indexingDoc}</div>}
+                      {indexStatus && <div style={{ fontSize: 10, color: '#00a86b', marginTop: 3 }}>{indexStatus}</div>}
                     </div>
+                    {usingGitHub && hasApiKey && totalDocs > 0 && (
+                      <button
+                        onClick={async () => {
+                          if (indexing || !config.githubPat) return;
+                          setIndexing(true);
+                          setIndexStatus('');
+                          setIndexingDoc('');
+                          setSyncError('');
+                          try {
+                            const result = await indexAllDocuments(config.githubPat!, (docName, status) => {
+                              setIndexingDoc(status === 'indexing' ? docName : '');
+                            });
+                            if (result.errors.length > 0) {
+                              setSyncError(result.errors.join('\n'));
+                            }
+                            setIndexStatus(`Indexed ${result.indexed} chunk${result.indexed === 1 ? '' : 's'}, ${result.skipped} unchanged`);
+                          } catch (err) {
+                            setSyncError(err instanceof Error ? err.message : 'Indexing failed');
+                          } finally {
+                            setIndexing(false);
+                            setIndexingDoc('');
+                          }
+                        }}
+                        disabled={indexing}
+                        style={{
+                          ...recoBtnStyle,
+                          fontSize: 13,
+                          padding: '10px 18px',
+                          background: indexing ? '#ccc' : kbIsIndexed ? '#00a86b' : '#1496ff',
+                          cursor: indexing ? 'wait' : 'pointer',
+                        }}
+                      >
+                        {indexing ? '⏳ Indexing...' : kbIsIndexed ? '🔄 Re-index KB' : '🔍 Index KB'}
+                      </button>
+                    )}
                     {!usingGitHub && hasApiKey && hasPending && (
                       <button
                         onClick={async () => {
@@ -2026,12 +2096,12 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     );
   }
 
-  // ─── CHAT VIEW ───
+  // ─── CHAT VIEW (ADVANCED MODE) ───
   if (viewMode === 'chat') {
     return (
       <Flex width="100%" flexDirection="column" gap={0} style={{ height: '100%' }}>
         <TitleBar>
-          <TitleBar.Title>Your Own Query</TitleBar.Title>
+          <TitleBar.Title>Advanced Mode</TitleBar.Title>
           <TitleBar.Subtitle>
             {connected
               ? <span style={{ color: '#00a86b' }}>✓ Connected — {connectionInfo}</span>
@@ -2043,7 +2113,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           </TitleBar.Subtitle>
           <TitleBar.Action>
             <button onClick={() => setViewMode('explorer')} style={{ ...modeBtnStyle, background: '#6950a1' }}>
-              ← Back to Explorer
+              ← Simple Mode
             </button>
           </TitleBar.Action>
         </TitleBar>
@@ -2051,10 +2121,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
           {messages.length === 0 && !loading && (
             <div style={{ textAlign: 'center', color: '#999', marginTop: 60, fontSize: 14 }}>
-              Ask anything about your Dynatrace environment.<br />
-              {loadConfig().aiMode === 'dynatrace-assist'
-                ? 'Davis CoPilot will analyse your data and provide insights.'
-                : 'The AI assistant will use MCP tools to query data and provide insights.'}
+              Ask anything in plain English about your Dynatrace environment.<br />
+              The AI will automatically query your tenant data to build an answer.
             </div>
           )}
           {messages.map((msg, i) => (
@@ -2116,9 +2184,6 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             <button onClick={() => { setKbDocs(getKBDocuments()); setViewMode('kb'); }} style={{ ...modeBtnStyle, background: '#6950a1' }}>
               📄 Knowledge Base{kbDocs.length > 0 ? ` (${kbDocs.length})` : ''}
             </button>
-            <button onClick={() => setViewMode('chat')} style={{ ...modeBtnStyle, background: '#1496ff' }}>
-              💬 Your Own Query
-            </button>
           </div>
         </TitleBar.Action>
       </TitleBar>
@@ -2160,27 +2225,18 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         </div>
       </div>
 
-      {/* Natural language query bar */}
-      {connected && (
-        <div style={{ padding: '8px 16px', borderBottom: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)', display: 'flex', gap: 8, alignItems: 'center', background: 'var(--dt-colors-background-surface-default, #f8f8fb)' }}>
-          <span style={{ fontSize: 16 }}>🔮</span>
-          <input
-            value={nlQuery}
-            onChange={(e) => setNlQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleNaturalLanguageQuery(); } }}
-            placeholder="Ask in plain English… e.g. &quot;Show me all failed services in the last hour&quot;"
-            disabled={nlGenerating || loading}
-            style={{ flex: 1, padding: '8px 12px', borderRadius: 8, border: '1px solid var(--dt-colors-border-neutral-default, #d0d0d0)', fontSize: 13, outline: 'none', background: 'white', fontFamily: 'inherit' }}
-          />
-          <button
-            onClick={handleNaturalLanguageQuery}
-            disabled={!nlQuery.trim() || nlGenerating || loading}
-            style={{ ...actionBtnStyle, background: !nlQuery.trim() || nlGenerating || loading ? '#ccc' : '#6950a1', cursor: !nlQuery.trim() || nlGenerating || loading ? 'not-allowed' : 'pointer', fontSize: 12, padding: '8px 16px' }}
-          >
-            {nlGenerating ? '⏳ Generating...' : '⚡ Run'}
-          </button>
-        </div>
-      )}
+
+
+      {/* Mode switch bar */}
+      <div style={{ padding: '6px 16px', borderBottom: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)', display: 'flex', alignItems: 'center', background: 'var(--dt-colors-background-surface-default, #f8f8fb)' }}>
+        <span style={{ fontSize: 12, color: '#999', flex: 1 }}>Simple Mode — select a pre-built query above to run</span>
+        <button
+          onClick={() => setViewMode('chat')}
+          style={{ padding: '6px 18px', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg, #1496ff 0%, #6950a1 100%)', color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6 }}
+        >
+          🚀 Switch to Advanced Mode
+        </button>
+      </div>
 
       {/* Bottom: Output + Recommendations side by side */}
       <div style={{ flex: 1, display: 'grid', gridTemplateColumns: '1fr 1fr', minHeight: 0 }}>

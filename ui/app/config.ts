@@ -27,29 +27,42 @@ export interface GitHubModelOption {
   id: string;
   label: string;
   provider: string;
+  maxInput: number;  // free-tier input token limit (Enterprise may be higher for some)
+  tier: 'low' | 'high' | 'reasoning' | 'embedding'; // rate limit tier
 }
 
 export const GITHUB_MODEL_OPTIONS: GitHubModelOption[] = [
-  { id: 'openai/gpt-4.1', label: 'GPT-4.1', provider: 'OpenAI' },
-  { id: 'openai/gpt-4.1-mini', label: 'GPT-4.1 Mini', provider: 'OpenAI' },
-  { id: 'openai/gpt-4.1-nano', label: 'GPT-4.1 Nano', provider: 'OpenAI' },
-  { id: 'openai/gpt-4o', label: 'GPT-4o', provider: 'OpenAI' },
-  { id: 'openai/gpt-4o-mini', label: 'GPT-4o Mini', provider: 'OpenAI' },
-  { id: 'openai/gpt-5', label: 'GPT-5', provider: 'OpenAI' },
-  { id: 'openai/gpt-5-mini', label: 'GPT-5 Mini', provider: 'OpenAI' },
-  { id: 'openai/o4-mini', label: 'o4-mini', provider: 'OpenAI' },
-  { id: 'openai/o3-mini', label: 'o3-mini', provider: 'OpenAI' },
-  { id: 'openai/o3', label: 'o3', provider: 'OpenAI' },
-  { id: 'deepseek/deepseek-r1-0528', label: 'DeepSeek R1 0528', provider: 'DeepSeek' },
-  { id: 'deepseek/deepseek-r1', label: 'DeepSeek R1', provider: 'DeepSeek' },
-  { id: 'deepseek/deepseek-v3-0324', label: 'DeepSeek V3', provider: 'DeepSeek' },
-  { id: 'xai/grok-3', label: 'Grok 3', provider: 'xAI' },
-  { id: 'xai/grok-3-mini', label: 'Grok 3 Mini', provider: 'xAI' },
-  { id: 'meta/llama-4-maverick-17b-128e-instruct-fp8', label: 'Llama 4 Maverick', provider: 'Meta' },
-  { id: 'meta/meta-llama-3.1-405b-instruct', label: 'Llama 3.1 405B', provider: 'Meta' },
-  { id: 'mistral-ai/mistral-medium-2505', label: 'Mistral Medium 3', provider: 'Mistral' },
-  { id: 'cohere/cohere-command-a', label: 'Command A', provider: 'Cohere' },
+  // Low tier: 8K in (Enterprise: 8K in, 8K out), 450 req/day Enterprise
+  { id: 'openai/gpt-4.1', label: 'GPT-4.1', provider: 'OpenAI', maxInput: 8000, tier: 'low' },
+  { id: 'openai/gpt-4.1-mini', label: 'GPT-4.1 Mini', provider: 'OpenAI', maxInput: 8000, tier: 'low' },
+  { id: 'openai/gpt-4.1-nano', label: 'GPT-4.1 Nano', provider: 'OpenAI', maxInput: 8000, tier: 'low' },
+  { id: 'openai/gpt-4o', label: 'GPT-4o', provider: 'OpenAI', maxInput: 8000, tier: 'low' },
+  { id: 'openai/gpt-4o-mini', label: 'GPT-4o Mini', provider: 'OpenAI', maxInput: 8000, tier: 'low' },
+  { id: 'meta/llama-4-maverick-17b-128e-instruct-fp8', label: 'Llama 4 Maverick', provider: 'Meta', maxInput: 8000, tier: 'low' },
+  { id: 'meta/meta-llama-3.1-405b-instruct', label: 'Llama 3.1 405B', provider: 'Meta', maxInput: 8000, tier: 'low' },
+  { id: 'mistral-ai/mistral-medium-2505', label: 'Mistral Medium 3', provider: 'Mistral', maxInput: 8000, tier: 'low' },
+  { id: 'cohere/cohere-command-a', label: 'Command A', provider: 'Cohere', maxInput: 8000, tier: 'low' },
+  // Reasoning tier: 4K in, 4K-8K out, 10-12 req/day Enterprise
+  { id: 'openai/gpt-5', label: 'GPT-5 ⚠️ 4K limit', provider: 'OpenAI', maxInput: 4000, tier: 'reasoning' },
+  { id: 'openai/gpt-5-mini', label: 'GPT-5 Mini ⚠️ 4K limit', provider: 'OpenAI', maxInput: 4000, tier: 'reasoning' },
+  { id: 'openai/o4-mini', label: 'o4-mini ⚠️ 4K limit', provider: 'OpenAI', maxInput: 4000, tier: 'reasoning' },
+  { id: 'openai/o3-mini', label: 'o3-mini ⚠️ 4K limit', provider: 'OpenAI', maxInput: 4000, tier: 'reasoning' },
+  { id: 'openai/o3', label: 'o3 ⚠️ 4K limit', provider: 'OpenAI', maxInput: 4000, tier: 'reasoning' },
+  { id: 'deepseek/deepseek-r1-0528', label: 'DeepSeek R1 0528 ⚠️ 4K limit', provider: 'DeepSeek', maxInput: 4000, tier: 'reasoning' },
+  { id: 'deepseek/deepseek-r1', label: 'DeepSeek R1 ⚠️ 4K limit', provider: 'DeepSeek', maxInput: 4000, tier: 'reasoning' },
+  // High tier (Enterprise: 16K in, 8K out, 150 req/day)
+  { id: 'deepseek/deepseek-v3-0324', label: 'DeepSeek V3', provider: 'DeepSeek', maxInput: 8000, tier: 'high' },
+  // Special limits
+  { id: 'xai/grok-3', label: 'Grok 3', provider: 'xAI', maxInput: 4000, tier: 'reasoning' },
+  { id: 'xai/grok-3-mini', label: 'Grok 3 Mini', provider: 'xAI', maxInput: 4000, tier: 'reasoning' },
 ];
+
+/** Get the free-tier input token limit for the currently selected model. */
+export function getModelMaxInput(): number {
+  const config = loadConfig();
+  const model = GITHUB_MODEL_OPTIONS.find((m) => m.id === config.githubModel);
+  return model?.maxInput ?? 8000;
+}
 
 export interface McpConfig {
   aiMode: AIMode;

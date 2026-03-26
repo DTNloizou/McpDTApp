@@ -3,8 +3,8 @@ import { queryExecutionClient } from '@dynatrace-sdk/client-query';
 import { publicClient as davisCopilotClient } from '@dynatrace-sdk/client-davis-copilot';
 import type { ConversationResponse } from '@dynatrace-sdk/client-davis-copilot';
 import { documentsClient } from '@dynatrace-sdk/client-document';
-import { loadConfig } from './config';
-import { getDocumentFileRefs, buildKBContext, buildKBSummary } from './knowledge-base';
+import { loadConfig, getModelMaxInput } from './config';
+import { getDocumentFileRefs, buildKBContext, buildKBSummary, retrieveRelevantKB, isKBIndexed } from './knowledge-base';
 
 export interface ToolCall {
   tool: string;
@@ -198,12 +198,92 @@ export async function sendChat(
   message: string,
   history: { role: string; content: string }[],
   overrides?: ConnOverrides,
-  documents?: { file_id: string; title: string }[]
+  documents?: { file_id: string; title: string }[],
+  onToolCall?: (tc: ToolCallResult) => void,
 ): Promise<ChatResponse> {
   const config = loadConfig();
 
   // Route to Davis CoPilot when in dynatrace-assist mode
   if (config.aiMode === 'dynatrace-assist') {
+    // If an LLM provider is configured, use it for general chat
+    // (Davis CoPilot often refuses free-form questions)
+    if (isLLMConfigured()) {
+      const chatHistory = history
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({ role: m.role, content: m.content }));
+      chatHistory.push({ role: 'user', content: message });
+
+      const tokenBudget = getModelMaxInput();
+      const isLowBudget = tokenBudget <= 4000;
+
+      // For low-budget models (GPT-5, o3, etc.), use a minimal system prompt
+      // and skip KB context — the model can still discover data via tool calls
+      let kbContext = '';
+      if (!isLowBudget) {
+        if (isKBIndexed() && config.githubPat) {
+          try {
+            kbContext = await retrieveRelevantKB(message, config.githubPat);
+          } catch {
+            kbContext = buildKBSummary();
+          }
+        } else {
+          kbContext = buildKBSummary();
+        }
+      }
+
+      const systemPrompt = isLowBudget
+        ? [
+            'Dynatrace SRE assistant. Use execute_dql tool to query real data.',
+            'DQL: fetch bizevents/logs/spans/events/dt.entity.service',
+            'Metrics: timeseries avg(metric.key), from:now()-3d',
+            'Discover metrics: fetch dt.metrics | filter contains(metric.key,"keyword") | limit 20',
+            'INVALID: fetch problems/services/errors/traces/metrics',
+            'If a query fails, simplify it. Format DQL in ```dql blocks.',
+          ].join('\n')
+        : [
+            'You are a Dynatrace SRE expert assistant connected to a live Dynatrace tenant.',
+            'You have access to a tool called execute_dql that lets you run DQL queries against the tenant.',
+            'ALWAYS use execute_dql to fetch real data before answering questions — do NOT guess or hallucinate data.',
+            'Run multiple queries if needed to build a complete picture.',
+            '',
+            'VALID DQL DATA SOURCES (use ONLY these after "fetch"):',
+            '- bizevents — business events (payments, transactions, custom events)',
+            '- logs — log entries',
+            '- spans — distributed traces',
+            '- events — Davis problems, deployments, and other platform events. Filter by event.kind: "DAVIS_PROBLEM", "DAVIS_EVENT", "CUSTOM_DEPLOYMENT" etc.',
+            '- dt.entity.service, dt.entity.host, dt.entity.process_group — entity tables',
+            '',
+            'METRICS — use the "timeseries" command (NOT "fetch"):',
+            '  timeseries avg(metric.key), from:now()-3d',
+            '  timeseries { lcp = avg(web.vital.lcp), cls = avg(web.vital.cls), fid = avg(web.vital.fid) }, from:now()-3d',
+            '  timeseries avg(dt.host.cpu.usage), from:now()-1h, by:{dt.entity.host}',
+            'TIMESERIES RULES:',
+            '- Multiple metrics: timeseries { alias1 = fn(metric1), alias2 = fn(metric2) }, from:...',
+            '- Functions: avg(), sum(), min(), max(), count(), rate(), percentile()',
+            '- NEVER use "fetch" with metrics. NEVER use bin() or bucket with timeseries.',
+            '- To discover metrics: fetch dt.metrics | filter contains(metric.key, "keyword") | fields metric.key | limit 20',
+            '',
+            'INVALID: "fetch problems", "fetch services", "fetch errors", "fetch traces", "fetch metrics" — these do NOT exist.',
+            'For problems: fetch events | filter event.kind == "DAVIS_PROBLEM"',
+            'For services: fetch dt.entity.service',
+            '',
+            'DQL SYNTAX RULES:',
+            '- Group-by: summarize count(), by:{fieldName}',
+            '- contains() is a FUNCTION: contains(fieldName, "value")',
+            '- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)}',
+            '- Math: round(value, decimals:2), explicit *: (a / b) * 100',
+            '',
+            'If a query fails, try a simpler version. Do not keep retrying similar syntax.',
+            'Format DQL in ```dql code blocks.',
+            ...(kbContext ? ['', 'Knowledge base context:', kbContext] : []),
+          ].join('\n');
+
+      // For low-budget models, limit iterations and cap tool output size
+      const maxIter = isLowBudget ? 2 : 5;
+      return agenticChat(systemPrompt, chatHistory, onToolCall, maxIter);
+    }
+
+    // Fall back to Davis
     const messages: { role: string; content: string }[] = [
       ...history,
       { role: 'user', content: message },
@@ -367,9 +447,22 @@ async function callLLM(
       return { status: 'error', response: '', message: 'GitHub PAT not configured. Add it in Settings.' };
     }
 
-    // Use condensed KB summary for GitHub Models (free tier has 8K token input limit)
+    // Use RAG retrieval for KB context if indexed, otherwise fall back to summary
     // Skip if caller already embedded KB context in the system prompt
-    const kbContext = skipKB ? '' : buildKBSummary();
+    let kbContext = '';
+    if (!skipKB) {
+      if (isKBIndexed() && config.githubPat) {
+        try {
+          // Use the last user message as the query for retrieval
+          const lastMsg = userMessages[userMessages.length - 1]?.content || '';
+          kbContext = await retrieveRelevantKB(lastMsg, config.githubPat);
+        } catch {
+          kbContext = buildKBSummary();
+        }
+      } else {
+        kbContext = buildKBSummary();
+      }
+    }
     const fullSystem = [systemPrompt, kbContext].filter(Boolean).join('\n\n');
 
     const messages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [];
@@ -409,6 +502,228 @@ async function callLLM(
     },
   });
   return await res.json() as { status: string; response: string; usage?: { input_tokens: number; output_tokens: number }; message?: string };
+}
+
+/* ─── Agentic Chat with Tool-Calling ─── */
+
+/** Tool definitions exposed to the LLM */
+const AGENT_TOOLS = [
+  {
+    type: 'function' as const,
+    function: {
+      name: 'execute_dql',
+      description: 'Execute a DQL query against the Dynatrace tenant and return the results. Use this to fetch real data before answering questions.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: 'The DQL query to execute' },
+          reason: { type: 'string', description: 'Brief explanation of why this query is needed' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+];
+
+interface ToolCallResult {
+  tool: string;
+  input: Record<string, unknown>;
+  output: string;
+}
+
+/**
+ * Agentic chat — LLM can call tools (execute DQL) iteratively.
+ * Loops up to maxIterations, executing tool calls and feeding results back.
+ * `onToolCall` fires for each tool execution so the UI can show progress.
+ */
+export async function agenticChat(
+  systemPrompt: string,
+  userMessages: { role: string; content: string }[],
+  onToolCall?: (tc: ToolCallResult) => void,
+  maxIterations = 5,
+): Promise<ChatResponse> {
+  const config = loadConfig();
+  const tokenBudget = getModelMaxInput();
+  const toolOutputCap = tokenBudget <= 4000 ? 800 : 3000;
+
+  if (config.llmProvider !== 'github-models' || !config.githubPat) {
+    // Fall back to non-agentic callLLM for Anthropic (no tool-calling wired up)
+    const msgs = userMessages.map((m) => ({
+      role: m.role as 'user' | 'assistant',
+      content: m.content,
+    }));
+    return callLLM(msgs, systemPrompt, 4096, true);
+  }
+
+  // Build initial messages array with types compatible with the API
+  const messages: Record<string, unknown>[] = [
+    { role: 'system', content: systemPrompt },
+    ...userMessages,
+  ];
+
+  const allToolCalls: ToolCallResult[] = [];
+  let totalUsage = { input_tokens: 0, output_tokens: 0 };
+
+  for (let i = 0; i < maxIterations; i++) {
+    // Estimate token usage — trim old tool results if conversation is getting large
+    const trimThreshold = tokenBudget <= 4000 ? 6000 : 20000;
+    const msgJson = JSON.stringify(messages);
+    if (msgJson.length > trimThreshold) {
+      // Keep system + first user + last 4 messages, trim tool outputs in the middle
+      for (let m = 1; m < messages.length - 4; m++) {
+        if (messages[m].role === 'tool' && typeof messages[m].content === 'string') {
+          const content = messages[m].content as string;
+          if (content.length > 200) {
+            messages[m] = { ...messages[m], content: content.slice(0, 200) + '…(trimmed)' };
+          }
+        }
+      }
+    }
+
+    let res;
+    try {
+      res = await functions.call('github-chat', {
+        data: {
+          githubPat: config.githubPat,
+          model: config.githubModel || 'openai/gpt-4.1',
+          messages,
+          maxTokens: Math.min(4096, 4096),
+          tools: AGENT_TOOLS,
+        },
+      });
+    } catch (err) {
+      return { status: 'error', response: '', message: `API call failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+
+    const result = await res.json() as {
+      status: string;
+      response: string;
+      toolCalls?: { id: string; type: string; function: { name: string; arguments: string } }[];
+      finishReason?: string;
+      usage?: { input_tokens: number; output_tokens: number };
+      message?: string;
+    };
+
+    if (result.status !== 'success') {
+      return { status: 'error', response: '', message: result.message || 'LLM request failed' };
+    }
+
+    if (result.usage) {
+      totalUsage.input_tokens += result.usage.input_tokens;
+      totalUsage.output_tokens += result.usage.output_tokens;
+    }
+
+    // If no tool calls, the model is done — return the final response
+    if (!result.toolCalls || result.toolCalls.length === 0) {
+      return {
+        status: 'success',
+        response: result.response || '',
+        toolCalls: allToolCalls.length > 0 ? allToolCalls : undefined,
+        usage: totalUsage,
+      };
+    }
+
+    // Append the assistant message with tool_calls to the conversation
+    messages.push({
+      role: 'assistant',
+      content: result.response || null,
+      tool_calls: result.toolCalls,
+    });
+
+    // Execute each tool call and append results
+    for (const tc of result.toolCalls) {
+      let toolOutput = '';
+      const parsed = (() => { try { return JSON.parse(tc.function.arguments); } catch { return {}; } })();
+
+      if (tc.function.name === 'execute_dql') {
+        const query = parsed.query as string;
+        if (query) {
+          try {
+            const dqlResult = await executeDql(query, tokenBudget <= 4000 ? 20 : 100);
+            if (dqlResult.status === 'success') {
+              const raw = dqlResult.result?.content?.[0]?.text || 'No records returned';
+              // Cap results to stay within token budget
+              toolOutput = raw.length > toolOutputCap ? raw.slice(0, toolOutputCap) + '\n…(truncated)' : raw;
+            } else {
+              toolOutput = `Query failed: ${dqlResult.message || 'Unknown error'}`;
+            }
+          } catch (err) {
+            toolOutput = `Query error: ${err instanceof Error ? err.message : 'Unknown'}`;
+          }
+        } else {
+          toolOutput = 'Error: no query provided';
+        }
+      } else {
+        toolOutput = `Unknown tool: ${tc.function.name}`;
+      }
+
+      const tcResult: ToolCallResult = {
+        tool: tc.function.name,
+        input: parsed,
+        output: toolOutput,
+      };
+      allToolCalls.push(tcResult);
+      if (onToolCall) onToolCall(tcResult);
+
+      // Append tool result to conversation
+      messages.push({
+        role: 'tool',
+        tool_call_id: tc.id,
+        content: toolOutput,
+      });
+    }
+  }
+
+  // Max iterations reached — ask model for a final summary
+  // Trim conversation to fit token limits: keep system + user + last 4 tool exchanges
+  const trimmedMessages: Record<string, unknown>[] = [
+    messages[0], // system
+    messages[1], // original user message
+  ];
+  // Add the last 4 messages (most recent tool results)
+  const tail = messages.slice(-4);
+  trimmedMessages.push(...tail);
+  trimmedMessages.push({
+    role: 'user',
+    content: 'Please provide your final analysis based on all the data gathered so far. If queries failed, explain what you found and suggest what the user can try.',
+  });
+
+  try {
+    const finalRes = await functions.call('github-chat', {
+      data: {
+        githubPat: config.githubPat,
+        model: config.githubModel || 'openai/gpt-4.1',
+        messages: trimmedMessages,
+        maxTokens: 4096,
+      },
+    });
+
+    const finalResult = await finalRes.json() as { status: string; response: string; usage?: { input_tokens: number; output_tokens: number }; message?: string };
+    if (finalResult.usage) {
+      totalUsage.input_tokens += finalResult.usage.input_tokens;
+      totalUsage.output_tokens += finalResult.usage.output_tokens;
+    }
+
+    if (finalResult.status !== 'success') {
+      return { status: 'error', response: '', message: finalResult.message || 'Final summary request failed', toolCalls: allToolCalls };
+    }
+
+    return {
+      status: 'success',
+      response: finalResult.response || '',
+      toolCalls: allToolCalls,
+      usage: totalUsage,
+    };
+  } catch (err) {
+    // If the final call fails, return what we have from tool calls
+    const summary = allToolCalls.map((tc) => `**${tc.tool}** (${tc.input.query || ''}):\n${tc.output.slice(0, 300)}`).join('\n\n');
+    return {
+      status: 'success',
+      response: `Tool calls completed but the final analysis failed. Here are the raw results:\n\n${summary}`,
+      toolCalls: allToolCalls,
+      usage: totalUsage,
+    };
+  }
 }
 
 /**
