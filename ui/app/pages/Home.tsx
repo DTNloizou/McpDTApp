@@ -108,6 +108,26 @@ const CATEGORIES: Category[] = [
       { label: 'Recent Logs', emoji: '📋', query: 'fetch logs, from:now()-15m | summarize count(), by:{status} | sort `count()` desc' },
     ],
   },
+  {
+    id: 'rum',
+    label: 'RUM',
+    emoji: '🌐',
+    color: '#1496FF',
+    queries: [
+      { label: 'Session Overview (7d)', emoji: '📊', query: 'fetch user.sessions, from:now()-7d | summarize totalSessions = count(), avgDuration = avg(duration), avgRequests = avg(request_count), avgInteractions = avg(user_interaction_count), bounceRate = round(toDouble(countIf(user_interaction_count <= 1)) / toDouble(count()) * 100, decimals:2)' },
+      { label: 'Sessions by Browser', emoji: '🌐', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), avgDuration = avg(duration), by:{browser.name} | sort sessions desc | limit 10' },
+      { label: 'Sessions by OS', emoji: '📱', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), avgDuration = avg(duration), by:{os.name} | sort sessions desc | limit 10' },
+      { label: 'Sessions by Country', emoji: '🗺️', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), by:{geo.country.iso_code} | sort sessions desc | limit 15' },
+      { label: 'Sessions with Errors', emoji: '❌', query: 'fetch user.sessions, from:now()-7d | filter error.count > 0 | summarize errorSessions = count(), totalErrors = sum(error.count), avgErrorsPerSession = avg(error.count) | fieldsAdd errorSessionRate = "See Session Overview for total"' },
+      { label: 'Error Breakdown', emoji: '🐛', query: 'fetch user.sessions, from:now()-7d | filter error.count > 0 | summarize httpErrors4xx = sum(error.http_4xx_count), httpErrors5xx = sum(error.http_5xx_count), jsExceptions = sum(error.exception_count), totalErrors = sum(error.count)' },
+      { label: 'Device Types', emoji: '💻', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), avgDuration = avg(duration), by:{device.type} | sort sessions desc' },
+      { label: 'Top ISPs', emoji: '📡', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), avgDuration = avg(duration), errorRate = round(toDouble(countIf(error.count > 0)) / toDouble(count()) * 100, decimals:2), by:{client.isp} | sort sessions desc | limit 10' },
+      { label: 'JS Errors (Events)', emoji: '⚠️', query: 'fetch user.events, from:now()-24h | filter error.type != "" | summarize errorCount = count(), by:{error.type, error.message} | sort errorCount desc | limit 15' },
+      { label: 'Page Load Actions', emoji: '📄', query: 'fetch user.events, from:now()-24h | filter navigation.type != "" | summarize pageLoads = count(), by:{navigation.type, page.source.url.full} | sort pageLoads desc | limit 15' },
+      { label: 'Session Trend (Hourly)', emoji: '📈', query: 'fetch user.sessions, from:now()-24h | summarize sessions = count(), by:{bin(timestamp, 1h)} | sort `bin(timestamp, 1h)` asc' },
+      { label: 'Screen Resolutions', emoji: '🖥️', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), by:{device.screen.width, device.screen.height} | sort sessions desc | limit 10' },
+    ],
+  },
 ];
 
 type ViewMode = 'explorer' | 'chat' | 'kb' | 'queries';

@@ -7,6 +7,7 @@ import {
   type KBDocument, type FileSyncStatus,
 } from '../knowledge-base';
 import { autoPopulateKB, type PopulateProgress } from '../kb-auto-populate';
+import { loadCredentials, saveCredentials, deleteCredentials, type StoredCredentials } from '../credential-store';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -35,6 +36,9 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   const [populating, setPopulating] = useState(false);
   const [populateProgress, setPopulateProgress] = useState<PopulateProgress | null>(null);
   const [populateMessage, setPopulateMessage] = useState('');
+  const [credStoreStatus, setCredStoreStatus] = useState<'idle' | 'loading' | 'saving' | 'deleting'>('idle');
+  const [credStoreMessage, setCredStoreMessage] = useState('');
+  const [storedCreds, setStoredCreds] = useState<StoredCredentials | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -55,7 +59,9 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
       setSyncMessage('');
       setPopulateMessage('');
       setPopulateProgress(null);
+      setCredStoreMessage('');
       loadKBDocuments().then((docs) => setKbDocs(docs));
+      loadCredentials().then((creds) => setStoredCreds(creds)).catch(() => {});
     }
   }, [open]);
 
@@ -72,6 +78,66 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
     githubPat,
     githubModel,
   });
+
+  /* ---- Credential Store handlers ---- */
+
+  const handleLoadFromStore = async () => {
+    setCredStoreStatus('loading');
+    setCredStoreMessage('');
+    try {
+      const creds = await loadCredentials();
+      if (!creds) {
+        setCredStoreMessage('No saved credentials found in Dynatrace.');
+        setCredStoreStatus('idle');
+        return;
+      }
+      if (creds.anthropicApiKey) { setClaudeApiKey(creds.anthropicApiKey); setClaudeEnabled(true); setAgentApiKey(creds.anthropicApiKey); }
+      if (creds.githubPat) setGithubPat(creds.githubPat);
+      if (creds.mcpBearerToken) setBearerToken(creds.mcpBearerToken);
+      if (creds.mcpServerUrl) setServerUrl(creds.mcpServerUrl);
+      if (creds.githubModel) setGithubModel(creds.githubModel);
+      setStoredCreds(creds);
+      setCredStoreMessage(`✓ Loaded credentials (saved ${creds.updatedAt ? new Date(creds.updatedAt).toLocaleString() : 'unknown'})`);
+    } catch (err: unknown) {
+      setCredStoreMessage(`✕ ${err instanceof Error ? err.message : 'Failed to load credentials'}`);
+    } finally {
+      setCredStoreStatus('idle');
+    }
+  };
+
+  const handleSaveToStore = async () => {
+    setCredStoreStatus('saving');
+    setCredStoreMessage('');
+    try {
+      const creds: StoredCredentials = {};
+      if (claudeApiKey.trim()) creds.anthropicApiKey = claudeApiKey;
+      if (githubPat.trim()) creds.githubPat = githubPat;
+      if (bearerToken.trim()) creds.mcpBearerToken = bearerToken;
+      if (serverUrl.trim()) creds.mcpServerUrl = serverUrl;
+      if (githubModel) creds.githubModel = githubModel;
+      await saveCredentials(creds);
+      setStoredCreds(creds);
+      setCredStoreMessage('✓ Credentials saved to Dynatrace');
+    } catch (err: unknown) {
+      setCredStoreMessage(`✕ ${err instanceof Error ? err.message : 'Failed to save credentials'}`);
+    } finally {
+      setCredStoreStatus('idle');
+    }
+  };
+
+  const handleDeleteFromStore = async () => {
+    setCredStoreStatus('deleting');
+    setCredStoreMessage('');
+    try {
+      await deleteCredentials();
+      setStoredCreds(null);
+      setCredStoreMessage('✓ Credentials removed from Dynatrace');
+    } catch (err: unknown) {
+      setCredStoreMessage(`✕ ${err instanceof Error ? err.message : 'Failed to delete credentials'}`);
+    } finally {
+      setCredStoreStatus('idle');
+    }
+  };
 
   const handleSave = () => {
     const config = buildConfig();
@@ -329,41 +395,6 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
 
           <Divider />
 
-          {/* Query Agent Section */}
-          <SectionHeader title="Query Agent" />
-
-          <FieldGroup label="Agent">
-            <select
-              value={agentType}
-              onChange={(e) => setAgentType(e.target.value as AgentType)}
-              style={inputStyle}
-            >
-              {AGENT_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-            <FieldHint>AI agent that processes your queries via MCP tools</FieldHint>
-          </FieldGroup>
-
-          <FieldGroup label={`${AGENT_OPTIONS.find((o) => o.value === agentType)?.label || 'Agent'} API Key`}>
-            <input
-              type="password"
-              value={agentApiKey}
-              onChange={(e) => setAgentApiKey(e.target.value)}
-              placeholder={agentType === 'claude' ? 'sk-ant-...' : 'API key'}
-              style={inputStyle}
-            />
-            <FieldHint>
-              {agentType === 'claude'
-                ? 'Your Anthropic API key for Claude'
-                : 'API key for the selected agent'}
-            </FieldHint>
-          </FieldGroup>
-
-          <Divider />
-
           {/* Knowledge Base Section */}
           <SectionHeader title="Knowledge Base" />
           <FieldHint>
@@ -591,51 +622,147 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
 
           <Divider />
 
-          {/* LLM Provider — replaces old Claude Integration */}
-          <SectionHeader title="LLM Provider" />
+          {/* Unified AI Agent section */}
+          <SectionHeader title="AI Agent" />
           <FieldHint>
-            Powers &quot;Ask Claude&quot; deep analysis and DQL repair. KB documents are included as context automatically.
+            Choose which AI powers your queries, analysis, and DQL repair. KB documents are included as context automatically.
           </FieldHint>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, margin: '12px 0 16px' }}>
+            {/* Davis CoPilot */}
+            <button
+              onClick={() => { setAgentType('davis-copilot'); }}
+              style={{
+                padding: '14px 16px',
+                borderRadius: 10,
+                border: `2px solid ${agentType === 'davis-copilot' ? '#00a86b' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
+                background: agentType === 'davis-copilot'
+                  ? 'rgba(0,168,107,0.06)'
+                  : 'var(--dt-colors-background-surface-default, #f8f8fb)',
+                cursor: 'pointer',
+                textAlign: 'left',
+                transition: 'all 0.15s',
+              }}
+            >
+              <div style={{ fontSize: 22, marginBottom: 6 }}>🤖</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
+                Davis CoPilot
+              </div>
+              <div style={{ fontSize: 11, color: '#999', lineHeight: 1.4 }}>
+                Built-in Dynatrace AI — no API keys needed
+              </div>
+              {agentType === 'davis-copilot' && (
+                <div style={{ marginTop: 6, fontSize: 11, fontWeight: 600, color: '#00a86b' }}>
+                  ✓ Selected
+                </div>
+              )}
+            </button>
 
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, margin: '12px 0 16px' }}>
-            {LLM_PROVIDER_OPTIONS.map((opt) => (
-              <button
-                key={opt.value}
-                onClick={() => setLlmProvider(opt.value)}
-                style={{
-                  padding: '14px 16px',
-                  borderRadius: 10,
-                  border: `2px solid ${llmProvider === opt.value ? '#6950A1' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
-                  background: llmProvider === opt.value
-                    ? 'rgba(105,80,161,0.06)'
-                    : 'var(--dt-colors-background-surface-default, #f8f8fb)',
-                  cursor: 'pointer',
-                  textAlign: 'left',
-                  transition: 'all 0.15s',
-                }}
-              >
-                <div style={{ fontSize: 22, marginBottom: 6 }}>{opt.emoji}</div>
-                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
-                  {opt.label}
+            {/* Claude (Anthropic) */}
+            <button
+              onClick={() => { setAgentType('claude'); setLlmProvider('anthropic'); }}
+              style={{
+                padding: '14px 16px',
+                borderRadius: 10,
+                border: `2px solid ${agentType === 'claude' && llmProvider === 'anthropic' ? '#6950A1' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
+                background: agentType === 'claude' && llmProvider === 'anthropic'
+                  ? 'rgba(105,80,161,0.06)'
+                  : 'var(--dt-colors-background-surface-default, #f8f8fb)',
+                cursor: 'pointer',
+                textAlign: 'left',
+                transition: 'all 0.15s',
+              }}
+            >
+              <div style={{ fontSize: 22, marginBottom: 6 }}>🧠</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
+                Claude
+              </div>
+              <div style={{ fontSize: 11, color: '#999', lineHeight: 1.4 }}>
+                Direct Anthropic API — Sonnet, Opus, Haiku
+              </div>
+              {agentType === 'claude' && llmProvider === 'anthropic' && (
+                <div style={{ marginTop: 6, fontSize: 11, fontWeight: 600, color: '#6950A1' }}>
+                  ✓ Selected
                 </div>
-                <div style={{ fontSize: 11, color: '#999', lineHeight: 1.4 }}>
-                  {opt.description}
+              )}
+            </button>
+
+            {/* GitHub Models */}
+            <button
+              onClick={() => { setAgentType('claude'); setLlmProvider('github-models'); }}
+              style={{
+                padding: '14px 16px',
+                borderRadius: 10,
+                border: `2px solid ${llmProvider === 'github-models' && agentType === 'claude' ? '#1496ff' : 'var(--dt-colors-border-neutral-default, #e0e0e0)'}`,
+                background: llmProvider === 'github-models' && agentType === 'claude'
+                  ? 'rgba(20,150,255,0.06)'
+                  : 'var(--dt-colors-background-surface-default, #f8f8fb)',
+                cursor: 'pointer',
+                textAlign: 'left',
+                transition: 'all 0.15s',
+              }}
+            >
+              <div style={{ fontSize: 22, marginBottom: 6 }}>🐙</div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 3 }}>
+                GitHub Models
+              </div>
+              <div style={{ fontSize: 11, color: '#999', lineHeight: 1.4 }}>
+                GPT-4o, DeepSeek, Grok &amp; more via GitHub
+              </div>
+              {llmProvider === 'github-models' && agentType === 'claude' && (
+                <div style={{ marginTop: 6, fontSize: 11, fontWeight: 600, color: '#1496ff' }}>
+                  ✓ Selected
                 </div>
-                {llmProvider === opt.value && (
-                  <div style={{ marginTop: 6, fontSize: 11, fontWeight: 600, color: '#6950A1' }}>
-                    ✓ Selected
-                  </div>
-                )}
-              </button>
-            ))}
+              )}
+            </button>
           </div>
 
-          {llmProvider === 'github-models' && (
+          {/* Davis CoPilot — no config needed */}
+          {agentType === 'davis-copilot' && (
+            <div style={{
+              padding: '16px 20px',
+              borderRadius: 10,
+              background: 'linear-gradient(135deg, rgba(0,168,107,0.08) 0%, rgba(0,152,212,0.08) 100%)',
+              border: '1px solid rgba(0,168,107,0.25)',
+              marginBottom: 16,
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 4 }}>
+                🤖 No API key required
+              </div>
+              <div style={{ fontSize: 12, color: '#666', lineHeight: 1.5 }}>
+                Davis CoPilot runs directly on your Dynatrace platform — no external API keys needed.
+              </div>
+            </div>
+          )}
+
+          {/* Claude (Anthropic) config */}
+          {agentType === 'claude' && llmProvider === 'anthropic' && (
             <div style={{
               padding: '14px 16px',
               borderRadius: 10,
               border: '1px solid rgba(105,80,161,0.25)',
               background: 'rgba(105,80,161,0.04)',
+              marginBottom: 16,
+            }}>
+              <FieldGroup label="Anthropic API Key">
+                <input
+                  type="password"
+                  value={claudeApiKey}
+                  onChange={(e) => { setClaudeApiKey(e.target.value); setClaudeEnabled(!!e.target.value); setAgentApiKey(e.target.value); }}
+                  placeholder="sk-ant-..."
+                  style={inputStyle}
+                />
+                <FieldHint>Your Anthropic API key. Used for deep analysis and DQL repair.</FieldHint>
+              </FieldGroup>
+            </div>
+          )}
+
+          {/* GitHub Models config */}
+          {agentType === 'claude' && llmProvider === 'github-models' && (
+            <div style={{
+              padding: '14px 16px',
+              borderRadius: 10,
+              border: '1px solid rgba(20,150,255,0.25)',
+              background: 'rgba(20,150,255,0.04)',
               marginBottom: 16,
             }}>
               <FieldGroup label="GitHub Personal Access Token">
@@ -668,26 +795,101 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
             </div>
           )}
 
-          {llmProvider === 'anthropic' && (
-            <div style={{
-              padding: '14px 16px',
-              borderRadius: 10,
-              border: '1px solid rgba(217,119,6,0.25)',
-              background: 'rgba(217,119,6,0.04)',
-              marginBottom: 16,
-            }}>
-              <FieldGroup label="Anthropic API Key">
-                <input
-                  type="password"
-                  value={claudeApiKey}
-                  onChange={(e) => { setClaudeApiKey(e.target.value); setClaudeEnabled(!!e.target.value); }}
-                  placeholder="sk-ant-..."
-                  style={inputStyle}
-                />
-                <FieldHint>Your Anthropic API key. Davis gathers context first, then Claude provides deeper analysis.</FieldHint>
-              </FieldGroup>
+          <Divider />
+
+          {/* Credential Store Section */}
+          <SectionHeader title="Credential Store" />
+          <FieldHint>
+            Save API keys to Dynatrace so any authorised user of this app can load them — no need for each person to enter their own keys.
+          </FieldHint>
+
+          <div style={{
+            marginTop: 12,
+            padding: '14px 16px',
+            borderRadius: 10,
+            border: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)',
+            background: 'var(--dt-colors-background-surface-default, #f8f8fb)',
+          }}>
+            {storedCreds && (
+              <div style={{
+                fontSize: 11,
+                color: '#00a86b',
+                marginBottom: 10,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}>
+                <span>🔐</span>
+                <span>
+                  Saved credentials found
+                  {storedCreds.updatedAt && ` (${new Date(storedCreds.updatedAt).toLocaleDateString()})`}
+                  {' — '}
+                  {[
+                    storedCreds.anthropicApiKey && 'Anthropic',
+                    storedCreds.githubPat && 'GitHub',
+                    storedCreds.mcpBearerToken && 'MCP Token',
+                    storedCreds.mcpServerUrl && 'MCP URL',
+                  ].filter(Boolean).join(', ')}
+                </span>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button
+                onClick={handleLoadFromStore}
+                disabled={credStoreStatus !== 'idle'}
+                style={{
+                  ...btnSecondaryStyle(credStoreStatus !== 'idle'),
+                  fontSize: 12,
+                  padding: '7px 12px',
+                  background: 'rgba(0,168,107,0.08)',
+                  borderColor: '#00a86b',
+                  color: credStoreStatus !== 'idle' ? undefined : '#00782A',
+                }}
+              >
+                {credStoreStatus === 'loading' ? '↻ Loading...' : '⬇ Load from Dynatrace'}
+              </button>
+              <button
+                onClick={handleSaveToStore}
+                disabled={credStoreStatus !== 'idle'}
+                style={{
+                  ...btnSecondaryStyle(credStoreStatus !== 'idle'),
+                  fontSize: 12,
+                  padding: '7px 12px',
+                  background: 'rgba(20,150,255,0.08)',
+                  borderColor: '#1496ff',
+                  color: credStoreStatus !== 'idle' ? undefined : '#1496ff',
+                }}
+              >
+                {credStoreStatus === 'saving' ? '↻ Saving...' : '⬆ Save to Dynatrace'}
+              </button>
+              {storedCreds && (
+                <button
+                  onClick={handleDeleteFromStore}
+                  disabled={credStoreStatus !== 'idle'}
+                  style={{
+                    ...btnSecondaryStyle(credStoreStatus !== 'idle'),
+                    fontSize: 12,
+                    padding: '7px 12px',
+                    borderColor: '#c62828',
+                    color: credStoreStatus !== 'idle' ? undefined : '#c62828',
+                  }}
+                >
+                  {credStoreStatus === 'deleting' ? '↻ Deleting...' : '🗑 Remove'}
+                </button>
+              )}
             </div>
-          )}
+
+            {credStoreMessage && (
+              <div style={{
+                fontSize: 12,
+                marginTop: 8,
+                color: credStoreMessage.startsWith('✓') ? '#00a86b' : credStoreMessage.startsWith('✕') ? '#c62828' : '#666',
+              }}>
+                {credStoreMessage}
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Footer */}

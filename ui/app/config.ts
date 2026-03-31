@@ -1,6 +1,6 @@
 const STORAGE_KEY = 'mcp_dt_app_config';
 
-export type AgentType = 'claude';
+export type AgentType = 'claude' | 'davis-copilot';
 export type AIMode = 'dynatrace-assist' | 'external-mcp';
 export type LLMProvider = 'github-models' | 'anthropic';
 
@@ -9,13 +9,14 @@ export interface AgentConfig {
   apiKey: string;
 }
 
-export const AGENT_OPTIONS: { value: AgentType; label: string }[] = [
-  { value: 'claude', label: 'Claude (Anthropic)' },
+export const AGENT_OPTIONS: { value: AgentType; label: string; emoji: string; description: string }[] = [
+  { value: 'claude', label: 'Claude (Anthropic)', emoji: '🧠', description: 'Direct Anthropic API — Claude Sonnet, Opus, Haiku' },
+  { value: 'davis-copilot', label: 'Davis CoPilot', emoji: '🤖', description: 'Built-in Dynatrace AI — no external API keys needed' },
 ];
 
 export const AI_MODE_OPTIONS: { value: AIMode; label: string; emoji: string; description: string }[] = [
   { value: 'dynatrace-assist', label: 'Dynatrace Assist', emoji: '🤖', description: 'Built-in Davis CoPilot — no external servers or API keys needed' },
-  { value: 'external-mcp', label: 'External MCP + Claude', emoji: '🔌', description: 'Connect to a remote MCP server with Anthropic Claude' },
+  { value: 'external-mcp', label: 'External MCP', emoji: '🔌', description: 'Connect to a remote MCP server for tool-calling and queries' },
 ];
 
 export const LLM_PROVIDER_OPTIONS: { value: LLMProvider; label: string; emoji: string; description: string }[] = [

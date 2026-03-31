@@ -1,7 +1,5 @@
 import { functions } from '@dynatrace-sdk/app-utils';
 import { queryExecutionClient } from '@dynatrace-sdk/client-query';
-import { publicClient as davisCopilotClient } from '@dynatrace-sdk/client-davis-copilot';
-import type { ConversationResponse } from '@dynatrace-sdk/client-davis-copilot';
 import { documentsClient } from '@dynatrace-sdk/client-document';
 import { loadConfig, getModelMaxInput } from './config';
 import { getDocumentFileRefs, buildKBContext, buildKBSummary, retrieveRelevantKB, isKBIndexed } from './knowledge-base';
@@ -133,45 +131,29 @@ export async function listTools(overrides?: ConnOverrides): Promise<McpTool[]> {
 }
 
 /**
- * Call Davis CoPilot via the official SDK.
- * Uses the recommenderConversation endpoint (non-streaming).
+ * Call Davis CoPilot via the app function (server-side).
+ * Routes through davis-copilot.function.ts so the request uses the
+ * app's identity & scopes rather than the calling user's IAM permissions.
  */
 async function davisChat(
   messages: { role: string; content: string }[]
 ): Promise<ChatResponse> {
-  // Build the text from the last user message;
-  // include history as supplementary context
   const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user');
   if (!lastUserMsg) {
     return { status: 'error', response: '', message: 'No user message provided' };
   }
 
-  const context: { type: 'supplementary' | 'instruction'; value: string }[] = [];
-
-  // Include conversation history as supplementary context
-  const historyMessages = messages.slice(0, -1);
-  if (historyMessages.length > 0) {
-    const historyText = historyMessages
-      .map((m) => `${m.role}: ${m.content}`)
-      .join('\n\n');
-    context.push({ type: 'supplementary', value: historyText });
-  }
-
   try {
-    const result = await davisCopilotClient.recommenderConversation({
-      body: {
-        text: lastUserMsg.content,
-        ...(context.length > 0 ? { context } : {}),
-      },
+    const res = await functions.call('davis-copilot', {
+      data: { messages },
     });
+    const body = await res.json() as { status: string; response?: string; message?: string };
 
-    // Non-streaming mode returns ConversationResponse
-    const conv = result as ConversationResponse;
-    if (conv.status === 'FAILED') {
-      return { status: 'error', response: '', message: conv.text || 'Davis CoPilot request failed' };
+    if (!body || body.status !== 'success') {
+      return { status: 'error', response: '', message: body?.message || 'Davis CoPilot request failed' };
     }
 
-    return { status: 'success', response: conv.text || '' };
+    return { status: 'success', response: body.response || '' };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Unknown Davis CoPilot error';
     return { status: 'error', response: '', message: msg };
@@ -179,16 +161,18 @@ async function davisChat(
 }
 
 /**
- * Test Davis CoPilot connectivity by listing available skills.
+ * Test Davis CoPilot connectivity via the app function.
  */
 export async function testDavisConnection(): Promise<ConnectionResult> {
   try {
-    const skills = await davisCopilotClient.listAvailableSkills();
-    return {
-      status: 'success',
-      message: 'Connected',
-      environment: `Dynatrace Assist (${Array.isArray(skills) ? skills.length : 0} skills available)`,
-    };
+    const res = await functions.call('davis-copilot', {
+      data: { messages: [{ role: 'user', content: 'Hello' }] },
+    });
+    const body = await res.json() as { status: string; message?: string };
+    if (body?.status === 'success') {
+      return { status: 'success', message: 'Connected', environment: 'Dynatrace Assist' };
+    }
+    return { status: 'error', message: body?.message || 'Davis CoPilot test failed' };
   } catch (err: unknown) {
     return { status: 'error', message: err instanceof Error ? err.message : 'Unknown error' };
   }
