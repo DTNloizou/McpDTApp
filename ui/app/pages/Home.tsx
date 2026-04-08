@@ -7,6 +7,7 @@ import { loadConfig, GITHUB_MODEL_OPTIONS } from '../config';
 import { getKBDocuments, buildKBContext, buildKBSummary, buildDiscoveryTasks, buildQueryGenerationPrompt, loadKBDocuments, addKBDocument, removeKBDocument, appendToKBDocument, detectPlaceholders, detectDiscoveryPlaceholders, loadPlaceholderValues, savePlaceholderValues, saveDiscoveryStatus, loadDiscoveryStatus, getDocumentFileRefs, uploadDocToAnthropic, deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus, applyReplacements, indexAllDocuments, isKBIndexed, getVectorIndexStats, type KBDocument, type PlaceholderInfo, type DiscoveryPlaceholder } from '../knowledge-base';
 import { loadCustomCategories, getCustomCategories, saveCustomCategories, type CustomCategory, type CustomQuery } from '../custom-queries';
 import { autoPopulateKB, type PopulateProgress } from '../kb-auto-populate';
+import { loadHistory, getHistory, addHistoryEntry, deleteHistoryEntry, clearHistory, type HistoryEntry } from '../recommendation-history';
 
 interface Message {
   role: 'user' | 'assistant' | 'system' | 'error';
@@ -130,7 +131,7 @@ const CATEGORIES: Category[] = [
   },
 ];
 
-type ViewMode = 'explorer' | 'chat' | 'kb' | 'queries';
+type ViewMode = 'explorer' | 'chat' | 'kb' | 'queries' | 'history';
 
 /* ─── Helper components ─── */
 
@@ -240,6 +241,10 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   const [editingQuery, setEditingQuery] = useState<{ catId: string; qIdx: number } | null>(null);
   const [addingQueryTo, setAddingQueryTo] = useState<string | null>(null);
   const [addingCategory, setAddingCategory] = useState(false);
+
+  // History state
+  const [historyEntries, setHistoryEntries] = useState<HistoryEntry[]>([]);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const outputEndRef = useRef<HTMLDivElement>(null);
 
@@ -278,6 +283,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       if (keys.length > 0) setDiscoveryStatus('success');
     });
     loadCustomCategories().then((cats) => setCustomCategories(cats));
+    loadHistory().then((entries) => setHistoryEntries(entries));
   }, []);
 
   const handleConnect = async (explicitUrl?: string, explicitKey?: string) => {
@@ -335,7 +341,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             return v.toLocaleString();
           }
           const s = String(v);
-          return s.length > 60 ? s.substring(0, 57) + '...' : s;
+          // Truncate long values (encoded IDs, base64, etc.) and pipe chars break tables
+          const clean = s.replace(/\|/g, '∣');
+          return clean.length > 40 ? clean.substring(0, 37) + '...' : clean;
         }).join(' | ') + ' |\n';
       });
       return table;
@@ -795,6 +803,131 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     return enriched;
   };
 
+  /** Check if recommendation contains any failed or empty queries */
+  const hasFailedQueries = (text: string): boolean =>
+    /\*Query returned no data:.*\*|\*Query error:.*\*|\*Retry failed:.*\*|\*Retry error:.*\*|\*\*Query Results\*\*\s*\(0 records\)/.test(text);
+
+  /**
+   * Retry only the failed DQL queries in the recommendation.
+   * For each failure: extract the DQL from the preceding code block,
+   * send it + the error through repairDqlWithClaude, re-execute, and
+   * replace the error text with the new result.
+   */
+  const retryFailedQueries = async (text: string): Promise<string> => {
+    // Two-pass approach: find code blocks, then check what follows each one
+    const codeBlockRegex = /```(?:dql|sql|)[ \t]*\n([\s\S]*?)```/g;
+    const failures: { blockStart: number; blockEnd: number; dql: string; errorStart: number; errorEnd: number; errorMsg: string }[] = [];
+
+    let cbMatch: RegExpExecArray | null;
+    while ((cbMatch = codeBlockRegex.exec(text)) !== null) {
+      const blockStart = cbMatch.index;
+      const blockEnd = cbMatch.index + cbMatch[0].length;
+      const dql = cbMatch[1].trim();
+      if (!dql.startsWith('fetch ') && !dql.startsWith('timeseries ')) continue;
+
+      // Look at text immediately after the code block for error/empty patterns
+      const after = text.slice(blockEnd);
+
+      // Pattern 1: *Query returned no data: ...*  or  *Query error: ...*  or  *Retry failed: ...*
+      const errMatch = after.match(/^\s*\n\n(\*(?:Query returned no data|Query error|Retry failed|Retry error):[\s\S]*?\*)/);
+      if (errMatch) {
+        const errorStart = blockEnd + errMatch.index!;
+        const errorEnd = errorStart + errMatch[0].length;
+        failures.push({ blockStart, blockEnd, dql, errorStart, errorEnd, errorMsg: errMatch[1].replace(/^\*/, '').replace(/\*$/, '').trim() });
+        continue;
+      }
+
+      // Pattern 2: **Query Results** (0 records):\n\nNo records returned
+      const emptyMatch = after.match(/^\s*\n\n(\*\*Query Results\*\*\s*\(0 records\):?\s*\n\nNo records returned)/);
+      if (emptyMatch) {
+        const errorStart = blockEnd + emptyMatch.index!;
+        const errorEnd = errorStart + emptyMatch[0].length;
+        failures.push({ blockStart, blockEnd, dql, errorStart, errorEnd, errorMsg: 'Query returned 0 records' });
+      }
+    }
+
+    if (failures.length === 0) return text;
+
+    let result = text;
+    // Process in reverse so indices stay valid
+    for (let i = failures.length - 1; i >= 0; i--) {
+      const { blockStart, blockEnd, dql, errorEnd, errorMsg } = failures[i];
+
+      try {
+        // Try to repair the DQL using the error message
+        let fixedDql = dql;
+        const repaired = await repairDqlWithClaude(dql, errorMsg);
+        let addedToLearnings = false;
+        if (repaired && repaired !== dql) {
+          fixedDql = repaired;
+          const lesson = `### Retry-repaired DQL\n**Original:** \`${dql}\`\n**Error:** ${errorMsg.slice(0, 300)}\n**Repaired:** \`${repaired}\`\n`;
+          await appendToKBDocument('dql-lessons.md', lesson);
+          addedToLearnings = true;
+        }
+
+        // Execute the (possibly repaired) query
+        const execResult = await executeDql(fixedDql, 50);
+        const raw = execResult.result?.content?.[0]?.text || '';
+
+        if (execResult.status === 'success' && raw && raw.length > 5) {
+          let tableOutput = '';
+          try {
+            const records = JSON.parse(raw) as Record<string, unknown>[];
+            if (Array.isArray(records) && records.length > 0) {
+              const keys = Object.keys(records[0]);
+              const header = '| ' + keys.join(' | ') + ' |';
+              const sep = '| ' + keys.map(() => '---').join(' | ') + ' |';
+              const rows = records.slice(0, 30).map((r) =>
+                '| ' + keys.map((k) => {
+                  const v = r[k];
+                  return v === null || v === undefined ? '' : String(v);
+                }).join(' | ') + ' |'
+              );
+              tableOutput = [header, sep, ...rows].join('\n');
+              if (records.length > 30) tableOutput += `\n\n*(showing 30 of ${records.length} records)*`;
+            } else {
+              tableOutput = raw;
+            }
+          } catch {
+            tableOutput = raw.length > 2000 ? raw.slice(0, 2000) + '\n...(truncated)' : raw;
+          }
+          const learningNote = addedToLearnings ? '\n\n*📝 Query repaired and added to learnings*' : '';
+          // Replace the old code block + error with the fixed code block + results
+          const newBlock = fixedDql !== dql
+            ? `\`\`\`dql\n${fixedDql}\n\`\`\`\n\n**Query Results** (${execResult.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}${learningNote}`
+            : result.slice(blockStart, blockEnd) + `\n\n**Query Results** (${execResult.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}`;
+          result = result.slice(0, blockStart) + newBlock + result.slice(errorEnd);
+        } else {
+          // Still failed — log and update error message
+          const finalErr = execResult.message || 'No data returned';
+          const lesson = `### Retry still failed\n**Query:** \`${fixedDql}\`\n**Error:** ${finalErr.slice(0, 300)}\n`;
+          await appendToKBDocument('dql-lessons.md', lesson);
+          const newErr = fixedDql !== dql
+            ? `\`\`\`dql\n${fixedDql}\n\`\`\`\n\n*Retry failed: ${finalErr}*\n\n*📝 Added to learnings*`
+            : result.slice(blockStart, blockEnd) + `\n\n*Retry failed: ${finalErr}*\n\n*📝 Added to learnings*`;
+          result = result.slice(0, blockStart) + newErr + result.slice(errorEnd);
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Unknown error';
+        result = result.slice(0, blockEnd) + `\n\n*Retry error: ${msg}*` + result.slice(errorEnd);
+      }
+    }
+    return result;
+  };
+
+  /** Save a recommendation to persistent history */
+  const saveToHistory = (content: string, persona?: string) => {
+    if (!lastQuery) return;
+    addHistoryEntry({
+      label: lastQuery.label,
+      dql: lastQuery.dql,
+      content,
+      persona,
+    }).then((entry) => {
+      setHistoryEntries((prev) => [entry, ...prev.filter((e) => e.id !== entry.id)]);
+    }).catch(() => {/* best-effort */});
+  };
+
   const handleExportRecommendationsMd = () => {
     if (!recommendation || recommendation.role !== 'assistant') return;
     const now = new Date();
@@ -845,6 +978,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
         const entry = `## ${lastQuery.label} — ${timestamp}\n\n**Query:** \`${lastQuery.dql.slice(0, 200)}\`\n\n${result.response.slice(0, 2000)}`;
         appendToKBDocument('discovered-findings.md', entry).catch(() => {/* best-effort */});
+        saveToHistory(result.response, 'Davis');
       } else {
         setRecommendation({ role: 'error', content: `Recommendations failed: ${result.message}` });
       }
@@ -858,7 +992,6 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     setRecoLoading(true);
     setRecommendation(null);
     try {
-      // Pass full KB documents to Claude (not just summaries) so it can learn DQL syntax, runbooks, etc.
       const kbContext = buildKBContext(placeholderValues);
       const result: ChatResponse = await getClaudeRecommendations(lastQuery.label, lastQuery.dql, lastQuery.results, kbContext || undefined);
       if (result.status === 'success') {
@@ -873,8 +1006,56 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
         const entry = `## ${lastQuery.label} (Claude) — ${timestamp}\n\n**Query:** \`${lastQuery.dql.slice(0, 200)}\`\n\n${result.response.slice(0, 2000)}`;
         appendToKBDocument('discovered-findings.md', entry).catch(() => {});
+        saveToHistory(result.response, 'Claude');
       } else {
         setRecommendation({ role: 'error', content: `Claude analysis failed: ${result.message}` });
+      }
+    } catch (err: unknown) {
+      setRecommendation({ role: 'error', content: `Error: ${err instanceof Error ? err.message : 'Unknown'}` });
+    } finally { setRecoLoading(false); }
+  };
+
+  const handlePersonaAnalysis = async (persona: typeof ANALYSIS_PERSONAS[number]) => {
+    if (!lastQuery || recoLoading) return;
+    setRecoLoading(true);
+    setRecommendation(null);
+    try {
+      const kbContext = buildKBContext(placeholderValues);
+      const result: ChatResponse = await getClaudeRecommendations(
+        lastQuery.label, lastQuery.dql, lastQuery.results, kbContext || undefined, persona.systemPrompt,
+        (tc) => {
+          // Show live MCP tool calls in the recommendation area
+          const query = tc.input.query || '';
+          const reason = tc.input.reason ? ` — ${tc.input.reason}` : '';
+          setRecommendation((prev) => {
+            const line = `🔧 \`${query}\`${reason}`;
+            if (prev && prev.role === 'system') {
+              return { role: 'system', content: prev.content + '\n' + line };
+            }
+            return { role: 'system', content: `**${persona.emoji} ${persona.name} is querying Dynatrace...**\n\n` + line };
+          });
+          // Log failed DQL queries to dql-lessons.md so future prompts can learn
+          if (tc.output && (tc.output.startsWith('Query failed') || tc.output.startsWith('Query error') || tc.output.includes('FIELD_DOES_NOT_EXIST') || tc.output.includes('SYNTAX_ERROR') || tc.output.includes('UNKNOWN_FUNCTION') || tc.output.includes('PARSE_ERROR') || tc.output.includes('DQL-ERROR'))) {
+            const lesson = `### Agentic DQL Error (${persona.name})\n**Query:** \`${query}\`\n**Error:** ${tc.output.slice(0, 400)}\n`;
+            appendToKBDocument('dql-lessons.md', lesson).catch(() => {});
+          }
+        },
+      );
+      if (result.status === 'success') {
+        setRecommendation({ role: 'assistant', content: result.response, toolCalls: result.toolCalls });
+        setEnrichingReco(true);
+        try {
+          const enriched = await enrichRecommendationContent(result.response);
+          setRecommendation({ role: 'assistant', content: enriched, toolCalls: result.toolCalls });
+        } finally {
+          setEnrichingReco(false);
+        }
+        const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
+        const entry = `## ${lastQuery.label} (${persona.name}) — ${timestamp}\n\n**Query:** \`${lastQuery.dql.slice(0, 200)}\`\n\n${result.response.slice(0, 2000)}`;
+        appendToKBDocument('discovered-findings.md', entry).catch(() => {});
+        saveToHistory(result.response, persona.name);
+      } else {
+        setRecommendation({ role: 'error', content: `${persona.name} analysis failed: ${result.message}` });
       }
     } catch (err: unknown) {
       setRecommendation({ role: 'error', content: `Error: ${err instanceof Error ? err.message : 'Unknown'}` });
@@ -2182,6 +2363,110 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     );
   }
 
+  // ─── HISTORY VIEW ───
+  if (viewMode === 'history') {
+    return (
+      <Flex width="100%" flexDirection="column" gap={0} style={{ height: '100%' }}>
+        <TitleBar>
+          <TitleBar.Title>🕒 Recommendation History</TitleBar.Title>
+          <TitleBar.Subtitle>
+            {historyEntries.length} saved recommendation{historyEntries.length !== 1 ? 's' : ''}
+          </TitleBar.Subtitle>
+          <TitleBar.Action>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button onClick={() => setViewMode('explorer')} style={{ ...modeBtnStyle, background: '#6950a1' }}>
+                ← Back to Explorer
+              </button>
+              {historyEntries.length > 0 && (
+                <button
+                  onClick={async () => {
+                    if (confirm('Clear all recommendation history? This cannot be undone.')) {
+                      await clearHistory();
+                      setHistoryEntries([]);
+                    }
+                  }}
+                  style={{ ...modeBtnStyle, background: '#c41a16' }}
+                >
+                  🗑 Clear All
+                </button>
+              )}
+            </div>
+          </TitleBar.Action>
+        </TitleBar>
+
+        <div style={{ flex: 1, overflowY: 'auto', padding: 16 }}>
+          {historyEntries.length === 0 ? (
+            <div style={{ textAlign: 'center', color: '#999', marginTop: 60, fontSize: 14 }}>
+              No recommendations saved yet. Run a query and get AI recommendations — they'll appear here automatically.
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {historyEntries.map((entry) => {
+                const date = new Date(entry.timestamp);
+                const timeStr = date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) + ' ' + date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+                const preview = entry.content.replace(/[#*`|>\n]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+                return (
+                  <div
+                    key={entry.id}
+                    style={{
+                      border: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)',
+                      borderRadius: 10,
+                      overflow: 'hidden',
+                      background: 'var(--dt-colors-background-surface-default, #fff)',
+                    }}
+                  >
+                    <div
+                      style={{
+                        padding: '12px 16px',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 12,
+                        cursor: 'pointer',
+                        background: 'var(--dt-colors-background-surface-default, #fafafa)',
+                      }}
+                      onClick={() => {
+                        setRecommendation({ role: 'assistant', content: entry.content });
+                        setLastQuery({ label: entry.label, dql: entry.dql, results: '' });
+                        setViewMode('explorer');
+                      }}
+                    >
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 4, color: 'var(--dt-colors-text-primary-default, #2c2d4d)' }}>
+                          {entry.label}
+                        </div>
+                        <div style={{ fontSize: 12, color: '#999', display: 'flex', gap: 12, alignItems: 'center' }}>
+                          <span>{timeStr}</span>
+                          {entry.persona && (
+                            <span style={{ background: 'rgba(105,80,161,0.12)', padding: '1px 8px', borderRadius: 4, fontWeight: 600, color: '#6950a1' }}>
+                              {entry.persona}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: 12, color: '#888', marginTop: 4 }}>{preview}...</div>
+                      </div>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          deleteHistoryEntry(entry.id).then(() => {
+                            setHistoryEntries((prev) => prev.filter((h) => h.id !== entry.id));
+                          });
+                        }}
+                        title="Delete this entry"
+                        style={{ background: 'none', border: 'none', fontSize: 16, color: '#999', cursor: 'pointer', padding: '4px 8px', borderRadius: 4 }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </Flex>
+    );
+  }
+
   // ─── EXPLORER VIEW (default) ───
   return (
     <Flex width="100%" flexDirection="column" gap={0} style={{ height: '100%' }}>
@@ -2203,6 +2488,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             </button>
             <button onClick={() => { setKbDocs(getKBDocuments()); setViewMode('kb'); }} style={{ ...modeBtnStyle, background: '#6950a1' }}>
               📄 Knowledge Base{kbDocs.length > 0 ? ` (${kbDocs.length})` : ''}
+            </button>
+            <button onClick={() => { setHistoryEntries(getHistory()); setViewMode('history'); }} style={{ ...modeBtnStyle, background: '#0098D4' }}>
+              🕒 History{historyEntries.length > 0 ? ` (${historyEntries.length})` : ''}
             </button>
           </div>
         </TitleBar.Action>
@@ -2312,6 +2600,25 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                 >
                   {enrichingReco ? '⏳ Running...' : '▶ Run Queries'}
                 </button>
+                {recommendation && hasFailedQueries(recommendation.content) && (
+                  <button
+                    onClick={async () => {
+                      if (!recommendation || enrichingReco) return;
+                      setEnrichingReco(true);
+                      try {
+                        const retried = await retryFailedQueries(recommendation.content);
+                        setRecommendation({ ...recommendation, content: retried });
+                      } finally {
+                        setEnrichingReco(false);
+                      }
+                    }}
+                    disabled={enrichingReco}
+                    title="Retry failed DQL queries — auto-repair syntax and re-execute"
+                    style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #E32017', background: 'rgba(227,32,23,0.08)', color: '#E32017', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, opacity: enrichingReco ? 0.6 : 1 }}
+                  >
+                    {enrichingReco ? '⏳ Retrying...' : '🔄 Retry Failed'}
+                  </button>
+                )}
                 <button
                   onClick={handleGenerateNotebook}
                   disabled={notebookGenerating}
@@ -2337,35 +2644,41 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
               </div>
             )}
             {lastQuery && !recommendation && !recoLoading && (
-              <div style={{ textAlign: 'center', marginTop: 30, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
+              <div style={{ textAlign: 'center', marginTop: 30, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 16 }}>
                 <div style={{ fontSize: 13, color: '#666' }}>Results ready for <strong>{lastQuery.label}</strong></div>
-                <div style={{ display: 'flex', gap: 10 }}>
-                  <button
-                    onClick={handleGetRecommendations}
-                    style={{ ...recoBtnStyle }}
-                  >
-                    🤖 Get AI Recommendations
-                  </button>
-                  {isLLMConfigured() && (() => {
-                    const cfg = loadConfig();
-                    const modelLabel = cfg.llmProvider === 'github-models'
-                      ? (GITHUB_MODEL_OPTIONS.find((m) => m.id === cfg.githubModel)?.label || cfg.githubModel)
-                      : 'Claude';
-                    return (
-                      <button
-                        onClick={handleAskClaude}
-                        style={{ ...recoBtnStyle, background: 'linear-gradient(135deg, #D97706 0%, #F59E0B 100%)' }}
-                      >
-                        🧠 Ask {modelLabel}
-                      </button>
-                    );
-                  })()}
-                </div>
-                <div style={{ fontSize: 11, color: '#999', maxWidth: 360, lineHeight: 1.5 }}>
-                  {isLLMConfigured()
-                    ? `AI Recommendations uses Davis CoPilot. The other button gets Davis context first, then sends to ${loadConfig().llmProvider === 'github-models' ? (GITHUB_MODEL_OPTIONS.find((m) => m.id === loadConfig().githubModel)?.label || 'your model') : 'Claude'} for deeper analysis.`
-                    : 'Configure an LLM provider in Settings to add deeper AI analysis.'}
-                </div>
+                <button
+                  onClick={handleGetRecommendations}
+                  style={{ ...recoBtnStyle }}
+                >
+                  🤖 DAVIS Intelligence Recommendations
+                </button>
+
+                {isLLMConfigured() && (
+                  <div style={{ width: '100%', maxWidth: 420, marginTop: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--dt-colors-text-primary-default, #2c2d4d)', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      AI Agent Analysis
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                      {ANALYSIS_PERSONAS.map((persona) => (
+                        <button
+                          key={persona.name}
+                          onClick={() => handlePersonaAnalysis(persona)}
+                          style={{
+                            ...recoBtnStyle,
+                            background: persona.colour,
+                            fontSize: 12,
+                            padding: '10px 14px',
+                          }}
+                        >
+                          {persona.emoji} Analyse as {persona.name}
+                        </button>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#999', marginTop: 8, lineHeight: 1.5 }}>
+                      Each persona analyses the results through a different lens using {loadConfig().llmProvider === 'github-models' ? (GITHUB_MODEL_OPTIONS.find((m) => m.id === loadConfig().githubModel)?.label || 'your model') : 'Claude'}.
+                    </div>
+                  </div>
+                )}
               </div>
             )}
             {recoLoading && (
@@ -2566,6 +2879,33 @@ const recoBtnStyle: React.CSSProperties = {
   transition: 'opacity 0.15s',
 };
 
+const ANALYSIS_PERSONAS = [
+  {
+    name: 'SRE',
+    emoji: '🔧',
+    colour: 'linear-gradient(135deg, #D97706 0%, #F59E0B 100%)',
+    systemPrompt: 'Senior SRE analysing Dynatrace data. Focus: root cause hypotheses, blast radius (% users affected), SLO/SLI definitions with thresholds, error budget calculations, incident classification (SEV1-3). No generic advice — every recommendation needs a metric and threshold.',
+  },
+  {
+    name: 'Security',
+    emoji: '🛡️',
+    colour: 'linear-gradient(135deg, #C62828 0%, #E53935 100%)',
+    systemPrompt: 'Security Analyst reviewing Dynatrace telemetry. Focus: threat indicators (error spikes, geo anomalies), attack surface mapping, OWASP Top 10 classification, 4xx vs 5xx pattern analysis, anomaly severity scoring (Critical/High/Medium/Low), specific detection rules as DQL queries.',
+  },
+  {
+    name: 'FinOps',
+    emoji: '💰',
+    colour: 'linear-gradient(135deg, #2E7D32 0%, #43A047 100%)',
+    systemPrompt: 'FinOps Engineer analysing Dynatrace data for cost. Focus: DDU cost estimation, data volume/growth rates, high-cardinality fields, query optimisation rewrites, resource utilisation, cost-per-transaction. Every recommendation must quantify savings (%, DDUs, or absolute).',
+  },
+  {
+    name: 'Performance',
+    emoji: '⚡',
+    colour: 'linear-gradient(135deg, #1565C0 0%, #1E88E5 100%)',
+    systemPrompt: 'Performance Engineer analysing Dynatrace data. Focus: latency percentiles (p50/p90/p99), bottleneck identification (service/endpoint), throughput (req/s), saturation indicators, scalability extrapolation, specific SLA/SLO targets with thresholds from observed data.',
+  },
+] as const;
+
 const queryInputStyle: React.CSSProperties = {
   padding: '8px 10px',
   borderRadius: 6,
@@ -2659,7 +2999,7 @@ function renderMarkdown(text: string): string {
       ? parseRow(lines[1]).map((cell: string) => (cell.trim().endsWith(':') ? 'right' : 'left'))
       : headers.map(() => 'left');
 
-    let table = '<div style="overflow-x:auto;margin:12px 0;max-width:100%"><table style="width:100%;border-collapse:collapse;font-size:13px;table-layout:auto;border-radius:8px;overflow:hidden">';
+    let table = '<div style="overflow-x:auto;margin:12px 0;max-width:100%"><table style="width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed;border-radius:8px;overflow:hidden">';
 
     // Header
     table += '<thead><tr>';
@@ -2675,7 +3015,7 @@ function renderMarkdown(text: string): string {
       const bg = (r - dataStart) % 2 === 0 ? 'transparent' : 'rgba(105,80,161,0.06)';
       table += `<tr style="background:${bg}">`;
       cells.forEach((cell: string, i: number) => {
-        table += `<td style="padding:8px 12px;text-align:${alignments[i] || 'left'};border-bottom:1px solid rgba(0,0,0,0.08)">${cell}</td>`;
+        table += `<td style="padding:8px 12px;text-align:${alignments[i] || 'left'};border-bottom:1px solid rgba(0,0,0,0.08);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px" title="${cell.replace(/"/g, '&quot;')}">${cell}</td>`;
       });
       table += '</tr>';
     }

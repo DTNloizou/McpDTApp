@@ -21,7 +21,8 @@
       { "name": "state:app-states:write", "comment": "Write KB documents to state store" },
       { "name": "state:app-states:delete", "comment": "Delete KB documents from state store" },
       { "name": "davis-copilot:conversations:execute", "comment": "Use Davis CoPilot for AI-assisted analysis" },
-      { "name": "document:documents:write", "comment": "Create analysis notebooks" }
+      { "name": "document:documents:write", "comment": "Create analysis notebooks" },
+      { "name": "environment-api:credentials:read", "comment": "Read credentials from the Credential Vault" }
     ]
   }
 }

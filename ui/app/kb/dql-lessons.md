@@ -25,12 +25,43 @@ After aliasing, use `sort time` not `sort timestamp`.
 
 ---
 
-### Group-by uses curly braces
+### Group-by uses curly braces AND comma separator
 **Wrong:** `summarize count() by fieldName`
+**Wrong:** `summarize count(), avgErrors = avg(error.count) by:{field}`
 **Correct:** `summarize count(), by:{fieldName}`
+**Correct:** `summarize sessions = count(), avgErrors = avg(error.count), by:{field}`
+**Why:** There MUST be a comma before `by:` — it is a separate parameter, not a continuation.
+
+---
+
+### countIf is camelCase, not count_if
+**Wrong:** `countIf` alternatives: `count_if()`, `COUNT_IF()`
+**Correct:** `countIf(condition)` — e.g. `countIf(error.count > 0)`
+
+---
+
+### fieldsAdd not compute
+**Wrong:** `| compute newField = expression`
+**Correct:** `| fieldsAdd newField = expression`
+
+---
+
+### sort must use alias, not aggregation function
+**Wrong:** `| summarize cnt = count() | sort count() desc`
+**Correct:** `| summarize cnt = count() | sort cnt desc`
+**Why:** After summarize, the field is named by its alias. `count()` doesn't exist as a field name.
 
 ---
 
 ### round() uses named parameter
 **Wrong:** `round(value, 2)`
 **Correct:** `round(value, decimals:2)`
+
+---
+
+### Never guess filter values — discover first
+**Wrong:** `fetch spans | filter contains(span.name, "settlement")` — guessing that a business concept appears as a span name
+**Correct workflow:**
+1. Discover what exists: `fetch spans, from:now()-7d | summarize cnt=count(), by:{span.name} | sort cnt desc | limit 20`
+2. Use an actual value from results: `fetch spans | filter span.name == "POST /api/payments"`
+**Why:** Bizevents use domain terms (e.g. "settlement"), but spans use HTTP/service names (e.g. "POST /api/v1/process"). Never assume a business term from one data source appears as a field value in another. Always run a discovery query first to find real values, then filter on those.

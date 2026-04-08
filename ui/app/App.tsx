@@ -3,10 +3,12 @@ import { Page, AppHeader } from '@dynatrace/strato-components-preview/layouts';
 import { Route, Routes, Link } from 'react-router-dom';
 import { Home, type HomeHandle } from './pages/Home';
 import { SettingsPanel } from './components/SettingsPanel';
+import { HelpPanel } from './components/HelpPanel';
 import { loadConfig } from './config';
 
 export const App = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [configured, setConfigured] = useState(() => !!loadConfig().serverUrl);
   const homeRef = useRef<HomeHandle>(null);
 
@@ -29,6 +31,24 @@ export const App = () => {
             </AppHeader.AppNavLink>
           </AppHeader.NavItems>
           <AppHeader.ActionItems>
+            <button
+              onClick={() => setHelpOpen(true)}
+              title="Help & Documentation"
+              style={{
+                background: 'none',
+                border: 'none',
+                cursor: 'pointer',
+                padding: '6px 8px',
+                borderRadius: 6,
+                display: 'flex',
+                alignItems: 'center',
+                color: 'var(--dt-colors-text-primary-default, #2c2d4d)',
+              }}
+            >
+              <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
+                <path d="M10 1a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm0 16.5a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15zm-.75-3h1.5v1.5h-1.5V14.5zm.75-9a3.25 3.25 0 0 0-3.25 3.25h1.5A1.75 1.75 0 0 1 10 7a1.75 1.75 0 0 1 1.75 1.75c0 1.75-2.625 1.531-2.625 4.25h1.5c0-1.906 2.625-2.125 2.625-4.25A3.25 3.25 0 0 0 10 5.5z" />
+              </svg>
+            </button>
             <button
               onClick={handleOpenSettings}
               title="Settings"
@@ -61,6 +81,12 @@ export const App = () => {
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         onConfigSaved={handleConfigSaved}
+      />
+
+      <HelpPanel
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+        onOpenSettings={handleOpenSettings}
       />
     </Page>
   );

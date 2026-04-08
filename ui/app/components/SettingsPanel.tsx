@@ -1,13 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { loadConfig, saveConfig, AGENT_OPTIONS, AI_MODE_OPTIONS, LLM_PROVIDER_OPTIONS, GITHUB_MODEL_OPTIONS, type McpConfig, type AgentType, type AIMode, type LLMProvider } from '../config';
 import { testConnection, testDavisConnection, listTools, type McpTool } from '../mcp-client';
-import {
-  getKBDocuments, addKBDocument, removeKBDocument, loadKBDocuments,
-  deleteDocFromAnthropic, syncAllDocsToAnthropic, getDocSyncStatus,
-  type KBDocument, type FileSyncStatus,
-} from '../knowledge-base';
-import { autoPopulateKB, type PopulateProgress } from '../kb-auto-populate';
-import { loadCredentials, saveCredentials, deleteCredentials, type StoredCredentials } from '../credential-store';
+
+import { isVaultId, testVaultCredential, resolveVaultCredentials, clearVaultCache } from '../credential-vault';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -30,15 +25,12 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
   const [statusMessage, setStatusMessage] = useState('');
   const [tools, setTools] = useState<McpTool[]>([]);
   const [saved, setSaved] = useState(false);
-  const [kbDocs, setKbDocs] = useState<KBDocument[]>([]);
-  const [syncing, setSyncing] = useState(false);
-  const [syncMessage, setSyncMessage] = useState('');
-  const [populating, setPopulating] = useState(false);
-  const [populateProgress, setPopulateProgress] = useState<PopulateProgress | null>(null);
-  const [populateMessage, setPopulateMessage] = useState('');
-  const [credStoreStatus, setCredStoreStatus] = useState<'idle' | 'loading' | 'saving' | 'deleting'>('idle');
-  const [credStoreMessage, setCredStoreMessage] = useState('');
-  const [storedCreds, setStoredCreds] = useState<StoredCredentials | null>(null);
+
+  const [vaultAnthropicId, setVaultAnthropicId] = useState('');
+  const [vaultGithubPatId, setVaultGithubPatId] = useState('');
+  const [vaultMcpTokenId, setVaultMcpTokenId] = useState('');
+  const [vaultStatus, setVaultStatus] = useState<Record<string, { ok: boolean; message: string }>>({});
+  const [vaultResolving, setVaultResolving] = useState(false);
 
   useEffect(() => {
     if (open) {
@@ -56,12 +48,11 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
       setSaved(false);
       setStatus('idle');
       setStatusMessage('');
-      setSyncMessage('');
-      setPopulateMessage('');
-      setPopulateProgress(null);
-      setCredStoreMessage('');
-      loadKBDocuments().then((docs) => setKbDocs(docs));
-      loadCredentials().then((creds) => setStoredCreds(creds)).catch(() => {});
+
+      setVaultAnthropicId(config.vaultAnthropicId || '');
+      setVaultGithubPatId(config.vaultGithubPatId || '');
+      setVaultMcpTokenId(config.vaultMcpTokenId || '');
+      setVaultStatus({});
     }
   }, [open]);
 
@@ -77,70 +68,39 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
     llmProvider,
     githubPat,
     githubModel,
+    vaultAnthropicId: vaultAnthropicId.trim() || undefined,
+    vaultGithubPatId: vaultGithubPatId.trim() || undefined,
+    vaultMcpTokenId: vaultMcpTokenId.trim() || undefined,
   });
 
-  /* ---- Credential Store handlers ---- */
-
-  const handleLoadFromStore = async () => {
-    setCredStoreStatus('loading');
-    setCredStoreMessage('');
-    try {
-      const creds = await loadCredentials();
-      if (!creds) {
-        setCredStoreMessage('No saved credentials found in Dynatrace.');
-        setCredStoreStatus('idle');
-        return;
-      }
-      if (creds.anthropicApiKey) { setClaudeApiKey(creds.anthropicApiKey); setClaudeEnabled(true); setAgentApiKey(creds.anthropicApiKey); }
-      if (creds.githubPat) setGithubPat(creds.githubPat);
-      if (creds.mcpBearerToken) setBearerToken(creds.mcpBearerToken);
-      if (creds.mcpServerUrl) setServerUrl(creds.mcpServerUrl);
-      if (creds.githubModel) setGithubModel(creds.githubModel);
-      setStoredCreds(creds);
-      setCredStoreMessage(`✓ Loaded credentials (saved ${creds.updatedAt ? new Date(creds.updatedAt).toLocaleString() : 'unknown'})`);
-    } catch (err: unknown) {
-      setCredStoreMessage(`✕ ${err instanceof Error ? err.message : 'Failed to load credentials'}`);
-    } finally {
-      setCredStoreStatus('idle');
-    }
-  };
-
-  const handleSaveToStore = async () => {
-    setCredStoreStatus('saving');
-    setCredStoreMessage('');
-    try {
-      const creds: StoredCredentials = {};
-      if (claudeApiKey.trim()) creds.anthropicApiKey = claudeApiKey;
-      if (githubPat.trim()) creds.githubPat = githubPat;
-      if (bearerToken.trim()) creds.mcpBearerToken = bearerToken;
-      if (serverUrl.trim()) creds.mcpServerUrl = serverUrl;
-      if (githubModel) creds.githubModel = githubModel;
-      await saveCredentials(creds);
-      setStoredCreds(creds);
-      setCredStoreMessage('✓ Credentials saved to Dynatrace');
-    } catch (err: unknown) {
-      setCredStoreMessage(`✕ ${err instanceof Error ? err.message : 'Failed to save credentials'}`);
-    } finally {
-      setCredStoreStatus('idle');
-    }
-  };
-
-  const handleDeleteFromStore = async () => {
-    setCredStoreStatus('deleting');
-    setCredStoreMessage('');
-    try {
-      await deleteCredentials();
-      setStoredCreds(null);
-      setCredStoreMessage('✓ Credentials removed from Dynatrace');
-    } catch (err: unknown) {
-      setCredStoreMessage(`✕ ${err instanceof Error ? err.message : 'Failed to delete credentials'}`);
-    } finally {
-      setCredStoreStatus('idle');
-    }
-  };
-
-  const handleSave = () => {
+  const handleSave = async () => {
     const config = buildConfig();
+
+    // If vault IDs are configured, resolve them to actual secrets before saving
+    if (config.vaultAnthropicId || config.vaultGithubPatId || config.vaultMcpTokenId) {
+      try {
+        clearVaultCache();
+        const resolved = await resolveVaultCredentials({
+          anthropicApiKey: config.vaultAnthropicId,
+          githubPat: config.vaultGithubPatId,
+          mcpBearerToken: config.vaultMcpTokenId,
+        });
+        if (resolved.anthropicApiKey) {
+          config.claudeApiKey = resolved.anthropicApiKey;
+          config.claudeEnabled = true;
+          config.agent.apiKey = resolved.anthropicApiKey;
+        }
+        if (resolved.githubPat) {
+          config.githubPat = resolved.githubPat;
+        }
+        if (resolved.mcpBearerToken) {
+          config.apiKey = resolved.mcpBearerToken;
+        }
+      } catch {
+        // Continue with whatever raw values are already set
+      }
+    }
+
     saveConfig(config);
     onClose();
     onConfigSaved?.();
@@ -393,230 +353,6 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
             </div>
           )}
 
-          <Divider />
-
-          {/* Knowledge Base Section */}
-          <SectionHeader title="Knowledge Base" />
-          <FieldHint>
-            Upload .md files as reference context. The AI will use these documents when generating recommendations and answering queries.
-          </FieldHint>
-
-          <div style={{ marginTop: 10, marginBottom: 12, display: 'flex', gap: 8, alignItems: 'center' }}>
-            <label
-              style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '7px 14px',
-                borderRadius: 6,
-                border: '1px dashed var(--dt-colors-border-neutral-default, #ccc)',
-                background: 'var(--dt-colors-background-surface-default, #f8f8fb)',
-                fontSize: 13,
-                cursor: 'pointer',
-                color: 'var(--dt-colors-text-primary-default, #2c2d4d)',
-              }}
-            >
-              📄 Upload .md files
-              <input
-                type="file"
-                accept=".md,.markdown,.txt"
-                multiple
-                style={{ display: 'none' }}
-                onChange={(e) => {
-                  const files = e.target.files;
-                  if (!files) return;
-                  Array.from(files).forEach((file) => {
-                    const reader = new FileReader();
-                    reader.onload = async () => {
-                      const text = reader.result as string;
-                      await addKBDocument(file.name, text);
-                      setKbDocs(getKBDocuments());
-                    };
-                    reader.readAsText(file);
-                  });
-                  e.target.value = '';
-                }}
-              />
-            </label>
-            {kbDocs.length > 0 && agentApiKey.trim() && (
-              <button
-                onClick={async () => {
-                  setSyncing(true);
-                  setSyncMessage('Syncing files to Anthropic...');
-                  try {
-                    const results = await syncAllDocsToAnthropic(agentApiKey);
-                    const uploaded = results.filter((r) => r.status === 'uploaded').length;
-                    const errors = results.filter((r) => r.status === 'error').length;
-                    const already = results.filter((r) => r.status === 'synced').length;
-                    const parts: string[] = [];
-                    if (uploaded) parts.push(`${uploaded} uploaded`);
-                    if (already) parts.push(`${already} already synced`);
-                    if (errors) parts.push(`${errors} failed`);
-                    setSyncMessage(`✓ ${parts.join(', ')}`);
-                    setKbDocs(getKBDocuments());
-                  } catch (err: unknown) {
-                    setSyncMessage(`✕ ${err instanceof Error ? err.message : 'Sync failed'}`);
-                  } finally {
-                    setSyncing(false);
-                  }
-                }}
-                disabled={syncing}
-                style={{
-                  ...btnSecondaryStyle(syncing),
-                  fontSize: 12,
-                  padding: '7px 12px',
-                }}
-                title="Upload documents to Anthropic Files API for efficient referencing"
-              >
-                {syncing ? '↻ Syncing...' : '☁ Sync to Claude'}
-              </button>
-            )}
-          </div>
-
-          {syncMessage && (
-            <div style={{
-              fontSize: 12,
-              color: syncMessage.startsWith('✓') ? '#00a86b' : syncMessage.startsWith('✕') ? '#c62828' : '#666',
-              marginBottom: 8,
-            }}>
-              {syncMessage}
-            </div>
-          )}
-
-          {/* Auto-populate button */}
-          {kbDocs.length > 0 && (
-            <div style={{ marginBottom: 12 }}>
-              <button
-                onClick={async () => {
-                  setPopulating(true);
-                  setPopulateMessage('');
-                  setPopulateProgress(null);
-                  try {
-                    const result = await autoPopulateKB((progress) => {
-                      setPopulateProgress({ ...progress });
-                    });
-                    setKbDocs(getKBDocuments());
-                    const parts: string[] = [];
-                    if (result.updated.length) parts.push(`${result.updated.length} docs updated`);
-                    if (result.errors.length) parts.push(`${result.errors.length} warnings`);
-                    setPopulateMessage(`✓ ${parts.join(', ') || 'Complete — no changes needed'}`);
-                  } catch (err: unknown) {
-                    setPopulateMessage(`✕ ${err instanceof Error ? err.message : 'Auto-populate failed'}`);
-                  } finally {
-                    setPopulating(false);
-                    setPopulateProgress(null);
-                  }
-                }}
-                disabled={populating}
-                style={{
-                  ...btnSecondaryStyle(populating),
-                  fontSize: 12,
-                  padding: '7px 12px',
-                  background: populating ? undefined : 'rgba(0,168,107,0.08)',
-                  borderColor: '#00a86b',
-                  color: populating ? undefined : '#00782A',
-                }}
-                title="Run DQL queries to auto-populate reference docs — no AI needed"
-              >
-                {populating ? '↻ Populating...' : '⚡ Auto-Populate with DQL'}
-              </button>
-              {populateProgress && (
-                <div style={{ marginTop: 6 }}>
-                  <div style={{
-                    height: 4,
-                    borderRadius: 2,
-                    background: 'var(--dt-colors-border-neutral-default, #e0e0e0)',
-                    overflow: 'hidden',
-                  }}>
-                    <div style={{
-                      height: '100%',
-                      width: `${populateProgress.pct}%`,
-                      background: '#00a86b',
-                      borderRadius: 2,
-                      transition: 'width 0.3s',
-                    }} />
-                  </div>
-                  <div style={{ fontSize: 11, color: '#666', marginTop: 3 }}>
-                    {populateProgress.phase}: {populateProgress.detail}
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          {populateMessage && (
-            <div style={{
-              fontSize: 12,
-              color: populateMessage.startsWith('✓') ? '#00a86b' : populateMessage.startsWith('✕') ? '#c62828' : '#666',
-              marginBottom: 8,
-            }}>
-              {populateMessage}
-            </div>
-          )}
-
-          {kbDocs.length === 0 && (
-            <div style={{ fontSize: 12, color: '#999', fontStyle: 'italic', marginBottom: 12 }}>
-              No documents uploaded yet.
-            </div>
-          )}
-
-          {kbDocs.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
-              {kbDocs.map((doc) => {
-                const syncStatus = getDocSyncStatus(doc.name);
-                return (
-                <div
-                  key={doc.name}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    padding: '6px 10px',
-                    borderRadius: 6,
-                    border: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)',
-                    background: 'var(--dt-colors-background-surface-default, #f8f8fb)',
-                    fontSize: 12,
-                  }}
-                >
-                  <span title={syncStatus === 'synced' ? 'Synced to Anthropic' : syncStatus === 'modified' ? 'Modified since last sync' : 'Not yet synced'}>
-                    {syncStatus === 'synced' ? '☁️' : syncStatus === 'modified' ? '🔄' : '📄'}
-                  </span>
-                  <span style={{ flex: 1, fontWeight: 500, color: 'var(--dt-colors-text-primary-default, #2c2d4d)' }}>{doc.name}</span>
-                  <span style={{ color: '#999', fontSize: 11 }}>
-                    {(doc.content.length / 1024).toFixed(1)}KB
-                  </span>
-                  {syncStatus === 'synced' && (
-                    <span style={{ color: '#00a86b', fontSize: 10, fontWeight: 600 }}>SYNCED</span>
-                  )}
-                  {syncStatus === 'modified' && (
-                    <span style={{ color: '#b36305', fontSize: 10, fontWeight: 600 }}>MODIFIED</span>
-                  )}
-                  <button
-                    onClick={async () => {
-                      // Delete from Anthropic if synced
-                      if (doc.fileId && agentApiKey.trim()) {
-                        try { await deleteDocFromAnthropic(doc.name, agentApiKey); } catch { /* best-effort */ }
-                      }
-                      await removeKBDocument(doc.name);
-                      setKbDocs(getKBDocuments());
-                    }}
-                    title="Remove document"
-                    style={{
-                      background: 'none',
-                      border: 'none',
-                      cursor: 'pointer',
-                      color: '#c62828',
-                      fontSize: 14,
-                      padding: '0 4px',
-                    }}
-                  >
-                    ✕
-                  </button>
-                </div>
-                );
-              })}
-            </div>
-          )}
             </>
           )}
 
@@ -765,19 +501,6 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
               background: 'rgba(20,150,255,0.04)',
               marginBottom: 16,
             }}>
-              <FieldGroup label="GitHub Personal Access Token">
-                <input
-                  type="password"
-                  value={githubPat}
-                  onChange={(e) => setGithubPat(e.target.value)}
-                  placeholder="ghp_... or github_pat_..."
-                  style={inputStyle}
-                />
-                <FieldHint>
-                  A GitHub PAT with Copilot access. Go to github.com → Settings → Developer settings → Personal access tokens.
-                </FieldHint>
-              </FieldGroup>
-
               <FieldGroup label="Model">
                 <select
                   value={githubModel}
@@ -797,10 +520,10 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
 
           <Divider />
 
-          {/* Credential Store Section */}
-          <SectionHeader title="Credential Store" />
+          {/* Credential Vault Section */}
+          <SectionHeader title="Credential Vault" />
           <FieldHint>
-            Save API keys to Dynatrace so any authorised user of this app can load them — no need for each person to enter their own keys.
+            Store your API keys securely in the <strong>Dynatrace Credential Vault</strong> (Settings → Credential Vault). Create a <em>Token</em> credential with <em>AppEngine</em> scope and <em>Owner access only</em>, then paste the credential ID below. Each user's keys are private — only the owner can resolve them.
           </FieldHint>
 
           <div style={{
@@ -810,86 +533,89 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
             border: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)',
             background: 'var(--dt-colors-background-surface-default, #f8f8fb)',
           }}>
-            {storedCreds && (
-              <div style={{
-                fontSize: 11,
-                color: '#00a86b',
-                marginBottom: 10,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-              }}>
-                <span>🔐</span>
-                <span>
-                  Saved credentials found
-                  {storedCreds.updatedAt && ` (${new Date(storedCreds.updatedAt).toLocaleDateString()})`}
-                  {' — '}
-                  {[
-                    storedCreds.anthropicApiKey && 'Anthropic',
-                    storedCreds.githubPat && 'GitHub',
-                    storedCreds.mcpBearerToken && 'MCP Token',
-                    storedCreds.mcpServerUrl && 'MCP URL',
-                  ].filter(Boolean).join(', ')}
-                </span>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              <button
-                onClick={handleLoadFromStore}
-                disabled={credStoreStatus !== 'idle'}
-                style={{
-                  ...btnSecondaryStyle(credStoreStatus !== 'idle'),
-                  fontSize: 12,
-                  padding: '7px 12px',
-                  background: 'rgba(0,168,107,0.08)',
-                  borderColor: '#00a86b',
-                  color: credStoreStatus !== 'idle' ? undefined : '#00782A',
-                }}
-              >
-                {credStoreStatus === 'loading' ? '↻ Loading...' : '⬇ Load from Dynatrace'}
-              </button>
-              <button
-                onClick={handleSaveToStore}
-                disabled={credStoreStatus !== 'idle'}
-                style={{
-                  ...btnSecondaryStyle(credStoreStatus !== 'idle'),
-                  fontSize: 12,
-                  padding: '7px 12px',
-                  background: 'rgba(20,150,255,0.08)',
-                  borderColor: '#1496ff',
-                  color: credStoreStatus !== 'idle' ? undefined : '#1496ff',
-                }}
-              >
-                {credStoreStatus === 'saving' ? '↻ Saving...' : '⬆ Save to Dynatrace'}
-              </button>
-              {storedCreds && (
-                <button
-                  onClick={handleDeleteFromStore}
-                  disabled={credStoreStatus !== 'idle'}
-                  style={{
-                    ...btnSecondaryStyle(credStoreStatus !== 'idle'),
-                    fontSize: 12,
-                    padding: '7px 12px',
-                    borderColor: '#c62828',
-                    color: credStoreStatus !== 'idle' ? undefined : '#c62828',
-                  }}
-                >
-                  {credStoreStatus === 'deleting' ? '↻ Deleting...' : '🗑 Remove'}
-                </button>
+            <FieldGroup label="Anthropic API Key — Vault ID">
+              <input
+                type="text"
+                value={vaultAnthropicId}
+                onChange={(e) => setVaultAnthropicId(e.target.value)}
+                placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
+                style={inputStyle}
+              />
+              {vaultStatus['anthropic'] && (
+                <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['anthropic'].ok ? '#00a86b' : '#c62828' }}>
+                  {vaultStatus['anthropic'].ok ? '✓' : '✕'} {vaultStatus['anthropic'].message}
+                </div>
               )}
-            </div>
+            </FieldGroup>
 
-            {credStoreMessage && (
-              <div style={{
+            <FieldGroup label="GitHub PAT — Vault ID">
+              <input
+                type="text"
+                value={vaultGithubPatId}
+                onChange={(e) => setVaultGithubPatId(e.target.value)}
+                placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
+                style={inputStyle}
+              />
+              {vaultStatus['github'] && (
+                <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['github'].ok ? '#00a86b' : '#c62828' }}>
+                  {vaultStatus['github'].ok ? '✓' : '✕'} {vaultStatus['github'].message}
+                </div>
+              )}
+            </FieldGroup>
+
+            <FieldGroup label="MCP Bearer Token — Vault ID">
+              <input
+                type="text"
+                value={vaultMcpTokenId}
+                onChange={(e) => setVaultMcpTokenId(e.target.value)}
+                placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
+                style={inputStyle}
+              />
+              {vaultStatus['mcp'] && (
+                <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['mcp'].ok ? '#00a86b' : '#c62828' }}>
+                  {vaultStatus['mcp'].ok ? '✓' : '✕'} {vaultStatus['mcp'].message}
+                </div>
+              )}
+            </FieldGroup>
+
+            <button
+              onClick={async () => {
+                setVaultResolving(true);
+                setVaultStatus({});
+                const newStatus: Record<string, { ok: boolean; message: string }> = {};
+                const ids = [
+                  { key: 'anthropic', id: vaultAnthropicId.trim() },
+                  { key: 'github', id: vaultGithubPatId.trim() },
+                  { key: 'mcp', id: vaultMcpTokenId.trim() },
+                ];
+                clearVaultCache();
+                for (const { key, id } of ids) {
+                  if (id) {
+                    newStatus[key] = await testVaultCredential(id);
+                  }
+                }
+                setVaultStatus(newStatus);
+                setVaultResolving(false);
+              }}
+              disabled={vaultResolving || (!vaultAnthropicId.trim() && !vaultGithubPatId.trim() && !vaultMcpTokenId.trim())}
+              style={{
+                ...btnSecondaryStyle(vaultResolving),
                 fontSize: 12,
-                marginTop: 8,
-                color: credStoreMessage.startsWith('✓') ? '#00a86b' : credStoreMessage.startsWith('✕') ? '#c62828' : '#666',
-              }}>
-                {credStoreMessage}
-              </div>
-            )}
+                padding: '7px 12px',
+                background: 'rgba(0,168,107,0.08)',
+                borderColor: '#00a86b',
+                color: vaultResolving ? undefined : '#00782A',
+              }}
+            >
+              {vaultResolving ? '↻ Resolving...' : '🔐 Test Vault Credentials'}
+            </button>
+
+            <FieldHint>
+              Vault credentials override any raw keys entered above. Leave blank to use raw keys instead.
+            </FieldHint>
           </div>
+
+
         </div>
 
         {/* Footer */}

@@ -319,7 +319,12 @@ export async function executeDql(
     }
 
     if (result.state === 'FAILED') {
-      return { status: 'error', message: 'DQL query failed' };
+      const errorDetail = result.result?.records?.[0] 
+        ? JSON.stringify(result.result.records[0]).slice(0, 500)
+        : (result as Record<string, unknown>).error 
+          ? JSON.stringify((result as Record<string, unknown>).error).slice(0, 500)
+          : 'DQL query failed';
+      return { status: 'error', message: errorDetail };
     }
 
     const records = result.result?.records || [];
@@ -566,14 +571,18 @@ export async function agenticChat(
 
     let res;
     try {
+      const payload = {
+        githubPat: config.githubPat,
+        model: config.githubModel || 'openai/gpt-4.1',
+        messages,
+        maxTokens: Math.min(2048, 4096),
+        tools: AGENT_TOOLS,
+      };
+      // Log approximate token usage for debugging
+      const approxTokens = Math.ceil(JSON.stringify(payload.messages).length / 4);
+      console.log(`[agenticChat] iteration=${i}, messages=${messages.length}, ~${approxTokens} tokens`);
       res = await functions.call('github-chat', {
-        data: {
-          githubPat: config.githubPat,
-          model: config.githubModel || 'openai/gpt-4.1',
-          messages,
-          maxTokens: Math.min(4096, 4096),
-          tools: AGENT_TOOLS,
-        },
+        data: payload,
       });
     } catch (err) {
       return { status: 'error', response: '', message: `API call failed: ${err instanceof Error ? err.message : String(err)}` };
@@ -771,6 +780,8 @@ export async function getClaudeRecommendations(
   queryDql: string,
   queryResults: string,
   kbContext?: string,
+  personaPrompt?: string,
+  onToolCall?: (tc: { tool: string; input: Record<string, unknown>; output: string }) => void,
 ): Promise<ChatResponse> {
   if (!isLLMConfigured()) {
     return { status: 'error', response: '', message: 'No LLM configured. Add a GitHub PAT or Anthropic API key in Settings.' };
@@ -783,36 +794,46 @@ export async function getClaudeRecommendations(
     : kbContext;
 
   // For GitHub Models (8K input token limit), cap results more aggressively
-  const maxResults = config.llmProvider === 'github-models' ? 3000 : 8000;
+  // When using persona (agentic mode with tools), leave room for tool definitions
+  const isAgentic = !!personaPrompt;
+  const maxResults = config.llmProvider === 'github-models'
+    ? (isAgentic ? 1500 : 3000)
+    : 8000;
   const trimmedResults = queryResults.length > maxResults
     ? queryResults.slice(0, maxResults) + '\n\n… (results truncated for brevity)'
     : queryResults;
 
-  // Step 1: Get Davis CoPilot context
+  // Step 1: Get Davis CoPilot context (skip for agentic mode — LLM queries Dynatrace directly)
   let davisContext = '';
-  try {
-    const davisPrompt = [
-      `Analyse the following Dynatrace query results and provide context about the environment, related problems, and any relevant observations.`,
-      ``,
-      `**Query:** ${queryLabel}`,
-      `**DQL:** \`${queryDql}\``,
-      `**Results:**`,
-      trimmedResults,
-    ].join('\n');
+  if (!isAgentic) {
+    try {
+      const davisPrompt = [
+        `Analyse the following Dynatrace query results and provide context about the environment, related problems, and any relevant observations.`,
+        ``,
+        `**Query:** ${queryLabel}`,
+        `**DQL:** \`${queryDql}\``,
+        `**Results:**`,
+        trimmedResults,
+      ].join('\n');
 
-    const davisResult = await davisChat([{ role: 'user', content: davisPrompt }]);
-    if (davisResult.status === 'success' && davisResult.response) {
-      davisContext = davisResult.response;
+      const davisResult = await davisChat([{ role: 'user', content: davisPrompt }]);
+      if (davisResult.status === 'success' && davisResult.response) {
+        davisContext = davisResult.response;
+      }
+    } catch {
+      // Davis context is optional — continue without it
     }
-  } catch {
-    // Davis context is optional — continue without it
   }
 
   // Step 2: Send to LLM with Davis context
+  const defaultPersona = `You are a Dynatrace SRE expert. You have been given query results from Dynatrace and contextual analysis from Davis CoPilot (Dynatrace's built-in AI).\nProvide a deep, actionable analysis that builds on Davis's insights.`;
+
+  // For agentic persona mode on GitHub Models, skip KB in system prompt to save tokens
+  // — the LLM can discover data via execute_dql instead
+  const includeKB = !isAgentic || config.llmProvider !== 'github-models';
   const systemPrompt = [
-    `You are a Dynatrace SRE expert. You have been given query results from Dynatrace and contextual analysis from Davis CoPilot (Dynatrace's built-in AI).`,
-    `Provide a deep, actionable analysis that builds on Davis's insights.`,
-    ...(effectiveKB ? [
+    personaPrompt || defaultPersona,
+    ...(includeKB && effectiveKB ? [
       ``,
       `IMPORTANT: The user has provided reference documents below. Study them carefully for:`,
       `- DQL query syntax and patterns (use these as templates for any queries you suggest)`,
@@ -840,27 +861,86 @@ export async function getClaudeRecommendations(
     ] : []),
     ``,
     `Based on the query results${davisContext ? ' and Davis CoPilot analysis' : ''}, provide:`,
-    `1. **Summary** — interpretation enriched with the Davis context`,
-    `2. **Key Findings** — anything concerning or noteworthy`,
-    `3. **Recommendations** — specific, actionable steps`,
-    `4. **Follow-up Queries** — additional DQL queries to drill deeper, formatted in \`\`\`dql code blocks`,
+    `1. **Summary** — go beyond restating numbers. Interpret what the data MEANS.`,
+    `2. **Key Findings** — specific anomalies, patterns, root causes.`,
+    `3. **Recommendations** — concrete, implementable actions with thresholds.`,
+    `4. **Follow-up Queries** — DQL in \`\`\`dql blocks using ONLY valid fields.`,
     ``,
-    `DQL SYNTAX RULES (Dynatrace Query Language is NOT SQL):`,
-    `- Group-by uses curly braces: summarize count(), by:{fieldName}  — NOT "summarize count() by fieldName"`,
-    `- Multiple group-by fields: summarize count(), by:{field1, field2}`,
-    `- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)}  — ALWAYS alias bin() so the field has a name`,
-    `- WRONG: by:{bin(timestamp, 1h)} — this drops the timestamp field name and breaks sort/references`,
-    `- Mixed: summarize total = count(), errors = countIf(status == "ERROR"), by:{serviceName, time = bin(timestamp, 1h)}`,
-    `- When using bin(), sort by the alias: sort time — NOT sort timestamp`,
-    `- Math: round(value, decimals:2)  — NOT round(value, 2)`,
-    `- Multiplication must use explicit *: (a / b) * 100 — NOT (a / b) 100`,
-    `- contains() is a FUNCTION not an operator: contains(fieldName, "value") — NOT fieldName contains "value"`,
-    `- toDouble() for arithmetic on string fields`,
+    ...(isAgentic ? [
+      `DQL SCHEMAS: bizevents(event.type,event.provider,timestamp) | logs(content,loglevel,log.source,dt.entity.service) | spans(span.name,duration,status_code,dt.entity.service,http.response.status_code,http.route) | events(event.kind,event.name,event.status) | user.sessions(duration,error.count,error.exception_count,error.http_4xx_count,error.http_5xx_count,browser.name,os.name,geo.country.iso_code,frontend.name,device.type) | user.events(error.id,error.type,error.message,page.source.url.full,navigation.type)`,
+      `DQL SYNTAX (CRITICAL — follow exactly):`,
+      `- summarize: alias results! summarize total=count(), errors=countIf(x>0), by:{field1, field2}`,
+      `- CURLY BRACES required for by: by:{field} NOT by:field — multiple fields: by:{f1, f2, f3}`,
+      `- sort by alias: summarize cnt=count() ... sort cnt desc — NEVER sort count() desc`,
+      `- countIf() NOT count_if() — e.g. countIf(error.count > 0)`,
+      `- fieldsAdd NOT compute — e.g. fieldsAdd pct = round(toDouble(a)/toDouble(b)*100, decimals:2)`,
+      `- round(value, decimals:2) NOT round(value, 2)`,
+      `- contains(field,"val") is a function NOT operator`,
+      `- toDouble() for arithmetic on aggregated fields`,
+      `- timeseries avg(metric.key), from:now()-3d — NOT fetch for metrics`,
+      ``,
+      `WORKFLOW (CRITICAL — follow this order):`,
+      `1. DISCOVER FIRST — NEVER guess field values. Before filtering on ANY field, run a discovery query to find actual values:`,
+      `   - For bizevents: fetch bizevents, from:now()-7d | summarize cnt=count(), by:{event.provider} | sort cnt desc | limit 20`,
+      `   - To discover custom fields on a bizevent: fetch bizevents, from:now()-7d | filter event.provider == "<actual value>" | limit 1`,
+      `   - For spans related to a bizevent: first get the trace IDs from the bizevent, then query spans by trace_id`,
+      `   - For span names: fetch spans, from:now()-7d | summarize cnt=count(), by:{span.name} | sort cnt desc | limit 20`,
+      `   - For log sources: fetch logs, from:now()-7d | summarize cnt=count(), by:{log.source} | sort cnt desc | limit 20`,
+      `2. USE REAL VALUES — only use field values that appeared in discovery results. Never fabricate span names, event types, or filter values.`,
+      `3. CORRELATE VIA DATA — to cross-reference (e.g. bizevents→spans), use shared fields like trace_id or dt.entity.service from your discovery results. Do NOT guess that a bizevent field name will appear as a span.name.`,
+      `4. EXECUTE AND VERIFY — run each query. If it returns 0 records, the filter is wrong. Re-discover and retry with corrected values.`,
+      `5. Only include queries with verified non-empty results in your final analysis. Drop or fix any that return nothing.`,
+    ] : [
+      `CRITICAL: Do NOT invent field names. Only use fields listed below for each data source.`,
+      ``,
+      `DQL DATA SOURCE SCHEMAS:`,
+      `- bizevents: event.type, event.provider, event.kind, timestamp, and custom fields`,
+      `- logs: content, loglevel, log.source, dt.entity.service, timestamp`,
+      `- spans: span.name, span.kind, duration, status_code, dt.entity.service, http.response.status_code, http.request.method, http.route, timestamp`,
+      `- events: event.kind ("DAVIS_PROBLEM","DAVIS_EVENT","CUSTOM_DEPLOYMENT"), event.name, event.status, dt.entity.service, timestamp`,
+      `- dt.entity.service: entity.name, id, lifetime, tags`,
+      `- dt.entity.host: entity.name, id, lifetime, tags`,
+      `- user.sessions: duration, user_interaction_count, request_count, navigation_count, error.count, error.exception_count, error.http_4xx_count, error.http_5xx_count, end_reason, device.type, os.name, browser.name, browser.version, client.isp, geo.country.iso_code, frontend.name, dt.rum.application.entities, characteristics.is_invalid, timestamp`,
+      `- user.events: error.id, error.type, error.message, dt.rum.application.id, os.name, browser.user_agent, page.source.url.full, navigation.type, client.isp, characteristics.classifier, timestamp`,
+      `- Metrics (use timeseries, NOT fetch): timeseries avg(metric.key), from:now()-3d`,
+      ``,
+      `DQL SYNTAX RULES (Dynatrace Query Language is NOT SQL):`,
+      `- Group-by uses curly braces: summarize count(), by:{fieldName}  — NOT "summarize count() by fieldName"`,
+      `- Multiple group-by fields: summarize count(), by:{field1, field2}`,
+      `- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)}  — ALWAYS alias bin() so the field has a name`,
+      `- WRONG: by:{bin(timestamp, 1h)} — this drops the timestamp field name and breaks sort/references`,
+      `- Mixed: summarize total = count(), errors = countIf(status == "ERROR"), by:{serviceName, time = bin(timestamp, 1h)}`,
+      `- When using bin(), sort by the alias: sort time — NOT sort timestamp`,
+      `- Math: round(value, decimals:2)  — NOT round(value, 2)`,
+      `- Multiplication must use explicit *: (a / b) * 100 — NOT (a / b) 100`,
+      `- contains() is a FUNCTION not an operator: contains(fieldName, "value") — NOT fieldName contains "value"`,
+      `- toDouble() for arithmetic on string fields`,
+    ]),
     ``,
     `Be concise and practical. Use bullet points.`,
   ].join('\n');
 
   try {
+    // When a persona is provided, try agentic mode (with tool-calling)
+    // Fall back to non-agentic if it fails (e.g. GitHub Models 500)
+    if (personaPrompt) {
+      try {
+        const agenticResult = await agenticChat(
+          systemPrompt,
+          [{ role: 'user', content: userMessage }],
+          onToolCall,
+          5,
+        );
+        // If agentic succeeded, return it; otherwise fall through to non-agentic
+        if (agenticResult.status === 'success') {
+          return agenticResult;
+        }
+        console.warn('[getClaudeRecommendations] Agentic mode returned error, falling back to non-agentic:', agenticResult.message);
+      } catch (e) {
+        console.warn('[getClaudeRecommendations] Agentic mode threw, falling back to non-agentic:', e);
+      }
+    }
+
     const result = await callLLM(
       [{ role: 'user', content: userMessage }],
       systemPrompt,

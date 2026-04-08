@@ -75,6 +75,10 @@ export interface McpConfig {
   llmProvider: LLMProvider;
   githubPat: string;
   githubModel: string;
+  /** Credential Vault IDs — when set, resolved at runtime instead of raw keys */
+  vaultAnthropicId?: string;
+  vaultGithubPatId?: string;
+  vaultMcpTokenId?: string;
 }
 
 const DEFAULT_CONFIG: McpConfig = {
@@ -87,6 +91,9 @@ const DEFAULT_CONFIG: McpConfig = {
   llmProvider: 'github-models',
   githubPat: '',
   githubModel: 'openai/gpt-4.1',
+  vaultAnthropicId: '',
+  vaultGithubPatId: '',
+  vaultMcpTokenId: '',
 };
 
 // In-memory config store — primary source of truth
@@ -101,7 +108,7 @@ export function loadConfig(): McpConfig {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored) {
       const parsed = JSON.parse(stored);
-      const cfg = { ...DEFAULT_CONFIG, ...parsed, agent: { ...DEFAULT_CONFIG.agent, ...parsed.agent }, aiMode: parsed.aiMode || DEFAULT_CONFIG.aiMode, claudeEnabled: parsed.claudeEnabled ?? DEFAULT_CONFIG.claudeEnabled, claudeApiKey: parsed.claudeApiKey ?? DEFAULT_CONFIG.claudeApiKey, llmProvider: parsed.llmProvider ?? DEFAULT_CONFIG.llmProvider, githubPat: parsed.githubPat ?? DEFAULT_CONFIG.githubPat, githubModel: parsed.githubModel ?? DEFAULT_CONFIG.githubModel };
+      const cfg = { ...DEFAULT_CONFIG, ...parsed, agent: { ...DEFAULT_CONFIG.agent, ...parsed.agent }, aiMode: parsed.aiMode || DEFAULT_CONFIG.aiMode, claudeEnabled: parsed.claudeEnabled ?? DEFAULT_CONFIG.claudeEnabled, claudeApiKey: parsed.claudeApiKey ?? DEFAULT_CONFIG.claudeApiKey, llmProvider: parsed.llmProvider ?? DEFAULT_CONFIG.llmProvider, githubPat: parsed.githubPat ?? DEFAULT_CONFIG.githubPat, githubModel: parsed.githubModel ?? DEFAULT_CONFIG.githubModel, vaultAnthropicId: parsed.vaultAnthropicId ?? DEFAULT_CONFIG.vaultAnthropicId, vaultGithubPatId: parsed.vaultGithubPatId ?? DEFAULT_CONFIG.vaultGithubPatId, vaultMcpTokenId: parsed.vaultMcpTokenId ?? DEFAULT_CONFIG.vaultMcpTokenId };
       inMemoryConfig = cfg;
       return { ...cfg, agent: { ...cfg.agent } };
     }
