@@ -479,10 +479,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         let match: RegExpExecArray | null;
         while ((match = dqlBlockRe.exec(cleanText)) !== null) {
           const dql = match[1].trim();
-          if (dql.startsWith('fetch ') || dql.startsWith('timeseries ')) {
+          const dqlBody = stripDqlComments(dql);
+          if (dqlBody.startsWith('fetch ') || dqlBody.startsWith('timeseries ')) {
             const before = cleanText.slice(lastIndex, match.index).trim();
             if (before) recoSections.push({ type: 'markdown', content: before });
-            recoSections.push({ type: 'dql', content: dql });
+            recoSections.push({ type: 'dql', content: dqlBody });
             lastIndex = match.index + match[0].length;
           }
         }
@@ -656,6 +657,22 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     }
   };
 
+  // Extract leading comment lines as a title and return the executable DQL body
+  const parseDqlBlock = (dql: string): { title: string; body: string } => {
+    const lines = dql.split('\n');
+    const commentLines: string[] = [];
+    let i = 0;
+    while (i < lines.length && /^\s*(#|--|\/\/)/.test(lines[i])) {
+      commentLines.push(lines[i].replace(/^\s*(#|--|\/\/)\s*/, '').trim());
+      i++;
+    }
+    return {
+      title: commentLines.filter(Boolean).join(' — '),
+      body: lines.slice(i).join('\n').trim(),
+    };
+  };
+  const stripDqlComments = (dql: string): string => parseDqlBlock(dql).body;
+
   // Fix common DQL syntax errors before execution
   const fixDqlSyntax = (dql: string): string => {
     let fixed = dql;
@@ -684,15 +701,16 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
   };
 
   const enrichRecommendationContent = async (text: string): Promise<string> => {
-    const blocks: { fullMatch: string; dql: string; index: number }[] = [];
+    const blocks: { fullMatch: string; dql: string; title: string; index: number }[] = [];
 
     // 1. Fenced code blocks: ```dql, ```sql, or plain ```
     const fencedRegex = /```(?:dql|sql|)[ \t]*\n([\s\S]*?)```/g;
     let m: RegExpExecArray | null;
     while ((m = fencedRegex.exec(text)) !== null) {
-      const dql = m[1].trim();
-      if (dql.startsWith('fetch ') || dql.startsWith('timeseries ')) {
-        blocks.push({ fullMatch: m[0], dql, index: m.index });
+      const raw = m[1].trim();
+      const { title, body: dqlBody } = parseDqlBlock(raw);
+      if (dqlBody.startsWith('fetch ') || dqlBody.startsWith('timeseries ')) {
+        blocks.push({ fullMatch: m[0], dql: dqlBody, title, index: m.index });
       }
     }
 
@@ -703,7 +721,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       const insideFenced = blocks.some((b) => m!.index >= b.index && m!.index < b.index + b.fullMatch.length);
       if (insideFenced) continue;
       if (dql.includes(' | ')) {
-        blocks.push({ fullMatch: m[0], dql, index: m.index });
+        blocks.push({ fullMatch: m[0], dql, title: '', index: m.index });
       }
     }
 
@@ -714,7 +732,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
       const insideExisting = blocks.some((b) => m!.index >= b.index && m!.index < b.index + b.fullMatch.length);
       if (insideExisting) continue;
       if (!/\|\s*(?:filter|summarize|fields|sort|limit|lookup|join|parse|append|compare|group|fieldsAdd|fieldsRemove|timeseries|makeTimeseries|countIf)/.test(dql)) continue;
-      blocks.push({ fullMatch: m[0], dql, index: m.index });
+      blocks.push({ fullMatch: m[0], dql, title: '', index: m.index });
     }
 
     if (blocks.length === 0) return text;
@@ -731,7 +749,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     // Process in reverse order so string indices stay valid
     let enriched = text;
     for (let i = deduped.length - 1; i >= 0; i--) {
-      const { fullMatch, dql, index } = deduped[i];
+      const { fullMatch, dql, title, index } = deduped[i];
       let insertText = '';
       try {
         // Step 1: Apply known syntax fixes
@@ -798,7 +816,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         insertText = `\n\n*Query error: ${errMsg}*`;
       }
       const endPos = index + fullMatch.length;
-      enriched = enriched.slice(0, endPos) + insertText + enriched.slice(endPos);
+      const titlePrefix = title ? `\n\n**${title}**\n` : '';
+      enriched = enriched.slice(0, index) + titlePrefix + enriched.slice(index, endPos) + insertText + enriched.slice(endPos);
     }
     return enriched;
   };
@@ -822,7 +841,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     while ((cbMatch = codeBlockRegex.exec(text)) !== null) {
       const blockStart = cbMatch.index;
       const blockEnd = cbMatch.index + cbMatch[0].length;
-      const dql = cbMatch[1].trim();
+      const dqlRaw = cbMatch[1].trim();
+      const dql = stripDqlComments(dqlRaw);
       if (!dql.startsWith('fetch ') && !dql.startsWith('timeseries ')) continue;
 
       // Look at text immediately after the code block for error/empty patterns
