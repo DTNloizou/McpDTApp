@@ -1,6 +1,6 @@
 {
   "name": "mcp-dt-app",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "description": "Dynatrace MCP Application",
   "private": true,
   "scripts": {

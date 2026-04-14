@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { loadConfig, saveConfig, AGENT_OPTIONS, AI_MODE_OPTIONS, LLM_PROVIDER_OPTIONS, GITHUB_MODEL_OPTIONS, type McpConfig, type AgentType, type AIMode, type LLMProvider } from '../config';
 import { testConnection, testDavisConnection, listTools, type McpTool } from '../mcp-client';
 
-import { isVaultId, testVaultCredential, resolveVaultCredentials, clearVaultCache } from '../credential-vault';
+import { testVaultCredential, resolveVaultCredentials, clearVaultCache } from '../credential-vault';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -137,6 +137,21 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
     setTools([]);
 
     const conn = { serverUrl: serverUrl.replace(/\/+$/, ''), apiKey: bearerToken };
+    // If a vault ID is configured for MCP bearer, resolve it first
+    if (vaultMcpTokenId.trim()) {
+      try {
+        clearVaultCache();
+        const resolved = await resolveVaultCredentials({ mcpBearerToken: vaultMcpTokenId.trim() });
+        if (resolved.mcpBearerToken) {
+          conn.apiKey = resolved.mcpBearerToken;
+          setVaultStatus((prev) => ({ ...prev, mcp: { ok: true, message: 'Resolved' } }));
+        }
+      } catch {
+        setStatus('error');
+        setStatusMessage('Failed to resolve MCP bearer token from Credential Vault');
+        return;
+      }
+    }
     try {
       const result = await testConnection(conn);
       if (result.status === 'success') {
@@ -306,15 +321,20 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
             <FieldHint>Full base URL of your MCP server (e.g. https://example.com/mcp)</FieldHint>
           </FieldGroup>
 
-          <FieldGroup label="Bearer Token">
+          <FieldGroup label="MCP Bearer Token — Vault ID">
             <input
-              type="password"
-              value={bearerToken}
-              onChange={(e) => setBearerToken(e.target.value)}
-              placeholder="mcp_..."
+              type="text"
+              value={vaultMcpTokenId}
+              onChange={(e) => setVaultMcpTokenId(e.target.value)}
+              placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
               style={inputStyle}
             />
-            <FieldHint>API key for authenticated MCP endpoints</FieldHint>
+            {vaultStatus['mcp'] && (
+              <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['mcp'].ok ? '#00a86b' : '#c62828' }}>
+                {vaultStatus['mcp'].ok ? '✓' : '✕'} {vaultStatus['mcp'].message}
+              </div>
+            )}
+            <FieldHint>Credential Vault ID for your MCP bearer token. Create a <em>Token</em> credential with <em>AppEngine</em> scope.</FieldHint>
           </FieldGroup>
 
           {/* Connection test */}
@@ -479,16 +499,42 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
               background: 'rgba(105,80,161,0.04)',
               marginBottom: 16,
             }}>
-              <FieldGroup label="Anthropic API Key">
+              <FieldGroup label="Anthropic API Key — Vault ID">
                 <input
-                  type="password"
-                  value={claudeApiKey}
-                  onChange={(e) => { setClaudeApiKey(e.target.value); setClaudeEnabled(!!e.target.value); setAgentApiKey(e.target.value); }}
-                  placeholder="sk-ant-..."
+                  type="text"
+                  value={vaultAnthropicId}
+                  onChange={(e) => setVaultAnthropicId(e.target.value)}
+                  placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
                   style={inputStyle}
                 />
-                <FieldHint>Your Anthropic API key. Used for deep analysis and DQL repair.</FieldHint>
+                {vaultStatus['anthropic'] && (
+                  <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['anthropic'].ok ? '#00a86b' : '#c62828' }}>
+                    {vaultStatus['anthropic'].ok ? '✓' : '✕'} {vaultStatus['anthropic'].message}
+                  </div>
+                )}
+                <FieldHint>Credential Vault ID for your Anthropic API key. Create a <em>Token</em> credential with <em>AppEngine</em> scope.</FieldHint>
               </FieldGroup>
+              <button
+                onClick={async () => {
+                  if (!vaultAnthropicId.trim()) return;
+                  setVaultResolving(true);
+                  clearVaultCache();
+                  const result = await testVaultCredential(vaultAnthropicId.trim());
+                  setVaultStatus((prev) => ({ ...prev, anthropic: result }));
+                  setVaultResolving(false);
+                }}
+                disabled={vaultResolving || !vaultAnthropicId.trim()}
+                style={{
+                  ...btnSecondaryStyle(vaultResolving || !vaultAnthropicId.trim()),
+                  fontSize: 12,
+                  padding: '7px 12px',
+                  background: 'rgba(105,80,161,0.08)',
+                  borderColor: '#6950A1',
+                  color: (vaultResolving || !vaultAnthropicId.trim()) ? undefined : '#6950A1',
+                }}
+              >
+                {vaultResolving ? '↻ Testing...' : '🔐 Test Vault Credentials'}
+              </button>
             </div>
           )}
 
@@ -501,119 +547,63 @@ export const SettingsPanel = ({ open, onClose, onConfigSaved }: SettingsPanelPro
               background: 'rgba(20,150,255,0.04)',
               marginBottom: 16,
             }}>
-              <FieldGroup label="Model">
-                <select
-                  value={githubModel}
-                  onChange={(e) => setGithubModel(e.target.value)}
+              <FieldGroup label="GitHub PAT — Vault ID">
+                <input
+                  type="text"
+                  value={vaultGithubPatId}
+                  onChange={(e) => setVaultGithubPatId(e.target.value)}
+                  placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
                   style={inputStyle}
-                >
-                  {GITHUB_MODEL_OPTIONS.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label} ({m.provider})
-                    </option>
-                  ))}
-                </select>
-                <FieldHint>Choose any model available through GitHub Models / Copilot.</FieldHint>
+                />
+                {vaultStatus['github'] && (
+                  <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['github'].ok ? '#00a86b' : '#c62828' }}>
+                    {vaultStatus['github'].ok ? '✓' : '✕'} {vaultStatus['github'].message}
+                  </div>
+                )}
+                <FieldHint>Credential Vault ID for your GitHub PAT. Create a <em>Token</em> credential with <em>AppEngine</em> scope.</FieldHint>
               </FieldGroup>
+              <button
+                onClick={async () => {
+                  if (!vaultGithubPatId.trim()) return;
+                  setVaultResolving(true);
+                  clearVaultCache();
+                  const result = await testVaultCredential(vaultGithubPatId.trim());
+                  setVaultStatus((prev) => ({ ...prev, github: result }));
+                  setVaultResolving(false);
+                }}
+                disabled={vaultResolving || !vaultGithubPatId.trim()}
+                style={{
+                  ...btnSecondaryStyle(vaultResolving || !vaultGithubPatId.trim()),
+                  fontSize: 12,
+                  padding: '7px 12px',
+                  background: 'rgba(20,150,255,0.08)',
+                  borderColor: '#1496ff',
+                  color: (vaultResolving || !vaultGithubPatId.trim()) ? undefined : '#1496ff',
+                }}
+              >
+                {vaultResolving ? '↻ Testing...' : '🔐 Test Vault Credentials'}
+              </button>
+              {vaultStatus['github']?.ok && (
+                <>
+                  <div style={{ marginTop: 14 }} />
+                  <FieldGroup label="Model">
+                    <select
+                      value={githubModel}
+                      onChange={(e) => setGithubModel(e.target.value)}
+                      style={inputStyle}
+                    >
+                      {GITHUB_MODEL_OPTIONS.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label} ({m.provider})
+                        </option>
+                      ))}
+                    </select>
+                    <FieldHint>Choose any model available through GitHub Models / Copilot.</FieldHint>
+                  </FieldGroup>
+                </>
+              )}
             </div>
           )}
-
-          <Divider />
-
-          {/* Credential Vault Section */}
-          <SectionHeader title="Credential Vault" />
-          <FieldHint>
-            Store your API keys securely in the <strong>Dynatrace Credential Vault</strong> (Settings → Credential Vault). Create a <em>Token</em> credential with <em>AppEngine</em> scope and <em>Owner access only</em>, then paste the credential ID below. Each user's keys are private — only the owner can resolve them.
-          </FieldHint>
-
-          <div style={{
-            marginTop: 12,
-            padding: '14px 16px',
-            borderRadius: 10,
-            border: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)',
-            background: 'var(--dt-colors-background-surface-default, #f8f8fb)',
-          }}>
-            <FieldGroup label="Anthropic API Key — Vault ID">
-              <input
-                type="text"
-                value={vaultAnthropicId}
-                onChange={(e) => setVaultAnthropicId(e.target.value)}
-                placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
-                style={inputStyle}
-              />
-              {vaultStatus['anthropic'] && (
-                <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['anthropic'].ok ? '#00a86b' : '#c62828' }}>
-                  {vaultStatus['anthropic'].ok ? '✓' : '✕'} {vaultStatus['anthropic'].message}
-                </div>
-              )}
-            </FieldGroup>
-
-            <FieldGroup label="GitHub PAT — Vault ID">
-              <input
-                type="text"
-                value={vaultGithubPatId}
-                onChange={(e) => setVaultGithubPatId(e.target.value)}
-                placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
-                style={inputStyle}
-              />
-              {vaultStatus['github'] && (
-                <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['github'].ok ? '#00a86b' : '#c62828' }}>
-                  {vaultStatus['github'].ok ? '✓' : '✕'} {vaultStatus['github'].message}
-                </div>
-              )}
-            </FieldGroup>
-
-            <FieldGroup label="MCP Bearer Token — Vault ID">
-              <input
-                type="text"
-                value={vaultMcpTokenId}
-                onChange={(e) => setVaultMcpTokenId(e.target.value)}
-                placeholder="CREDENTIALS_VAULT-XXXXXXXXXXXXXXXX"
-                style={inputStyle}
-              />
-              {vaultStatus['mcp'] && (
-                <div style={{ fontSize: 11, marginTop: 3, color: vaultStatus['mcp'].ok ? '#00a86b' : '#c62828' }}>
-                  {vaultStatus['mcp'].ok ? '✓' : '✕'} {vaultStatus['mcp'].message}
-                </div>
-              )}
-            </FieldGroup>
-
-            <button
-              onClick={async () => {
-                setVaultResolving(true);
-                setVaultStatus({});
-                const newStatus: Record<string, { ok: boolean; message: string }> = {};
-                const ids = [
-                  { key: 'anthropic', id: vaultAnthropicId.trim() },
-                  { key: 'github', id: vaultGithubPatId.trim() },
-                  { key: 'mcp', id: vaultMcpTokenId.trim() },
-                ];
-                clearVaultCache();
-                for (const { key, id } of ids) {
-                  if (id) {
-                    newStatus[key] = await testVaultCredential(id);
-                  }
-                }
-                setVaultStatus(newStatus);
-                setVaultResolving(false);
-              }}
-              disabled={vaultResolving || (!vaultAnthropicId.trim() && !vaultGithubPatId.trim() && !vaultMcpTokenId.trim())}
-              style={{
-                ...btnSecondaryStyle(vaultResolving),
-                fontSize: 12,
-                padding: '7px 12px',
-                background: 'rgba(0,168,107,0.08)',
-                borderColor: '#00a86b',
-                color: vaultResolving ? undefined : '#00782A',
-              }}
-            >
-              {vaultResolving ? '↻ Resolving...' : '🔐 Test Vault Credentials'}
-            </button>
-
-            <FieldHint>
-              Vault credentials override any raw keys entered above. Leave blank to use raw keys instead.
-            </FieldHint>
-          </div>
 
 
         </div>

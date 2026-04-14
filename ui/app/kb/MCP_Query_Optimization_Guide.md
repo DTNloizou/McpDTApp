@@ -25,14 +25,20 @@
 
 ## ✅ Best Practices for Low-Cost Queries
 
-### 1. Always Start with Entity Lookup (FREE)
+### 1. Filter by Entity Name using entityName() or Entity Lookup
+
+**Option A — entityName() in DQL (simplest):**
+```dql
+// Filter by human-readable name directly in the query
+| filter entityName(dt.entity.service) == "banking-account-service"
+```
+> ⚠️ **WRONG:** `dt.entity.service == "my-service"` — entity fields hold IDs like `SERVICE-XXX`, never names.
+
+**Option B — find_entity_by_name MCP tool (FREE, 0 GB):**
 ```
 Use: mcp_dynatrace-mcp_find_entity_by_name
-Before querying spans/logs, find the entity ID first.
-This costs 0 GB and gives you the correct filter.
+Returns the entity ID so you can filter by ID directly.
 ```
-
-**Example:** Instead of filtering by name in spans, get the entity ID first:
 - ✅ `find_entity_by_name("My Service")` → Returns `SERVICE-XXXXXXXXXXXX`
 - ✅ Then filter: `dt.entity.service == "SERVICE-XXXXXXXXXXXX"`
 

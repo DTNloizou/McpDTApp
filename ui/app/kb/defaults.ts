@@ -1409,22 +1409,26 @@ SERVICE-XXXX (Primary Service)
 
 ## 🔍 DQL Filters for Entities
 
-### Service Filter
+### Filter by Entity ID (when you know the ID)
 \`\`\`dql
 | filter dt.entity.service == "SERVICE-XXXXXXXXXXXX"
-\`\`\`
-
-### Host Filter
-\`\`\`dql
 | filter dt.entity.host == "HOST-XXXXXXXXXXXX"
-\`\`\`
-
-### Process Filter
-\`\`\`dql
 | filter dt.entity.process_group == "PROCESS_GROUP-XXXXXXXXXXXX"
 \`\`\`
 
-### Multiple Entity Filter
+### Filter by Entity Name (PREFERRED — human-readable)
+\`\`\`dql
+// Use entityName() to filter by name — entity fields always hold IDs, never names
+| filter entityName(dt.entity.service) == "banking-account-service"
+| filter entityName(dt.entity.host) == "my-hostname"
+
+// Multiple entities by name
+| filter entityName(dt.entity.service) == "service-a" OR entityName(dt.entity.service) == "service-b"
+\`\`\`
+
+> ⚠️ **WRONG:** \`dt.entity.service == "my-service-name"\` — this will NEVER match because the field contains an ID like \`SERVICE-B4F9C95D2BCCED72\`, not a name.
+
+### Multiple Entity Filter (by ID)
 \`\`\`dql
 | filter dt.entity.service in ("SERVICE-ID1", "SERVICE-ID2", "SERVICE-ID3")
 \`\`\`
@@ -1829,14 +1833,20 @@ export const MCP_Query_Optimization_Guide = `# MCP Query Optimization Guide
 
 ## ✅ Best Practices for Low-Cost Queries
 
-### 1. Always Start with Entity Lookup (FREE)
+### 1. Filter by Entity Name using entityName() or Entity Lookup
+
+**Option A — entityName() in DQL (simplest):**
+\`\`\`dql
+// Filter by human-readable name directly in the query
+| filter entityName(dt.entity.service) == "banking-account-service"
+\`\`\`
+> ⚠️ **WRONG:** \`dt.entity.service == "my-service"\` — entity fields hold IDs like \`SERVICE-XXX\`, never names.
+
+**Option B — find_entity_by_name MCP tool (FREE, 0 GB):**
 \`\`\`
 Use: mcp_dynatrace-mcp_find_entity_by_name
-Before querying spans/logs, find the entity ID first.
-This costs 0 GB and gives you the correct filter.
+Returns the entity ID so you can filter by ID directly.
 \`\`\`
-
-**Example:** Instead of filtering by name in spans, get the entity ID first:
 - ✅ \`find_entity_by_name("My Service")\` → Returns \`SERVICE-XXXXXXXXXXXX\`
 - ✅ Then filter: \`dt.entity.service == "SERVICE-XXXXXXXXXXXX"\`
 
@@ -2413,6 +2423,9 @@ fetch spans, from:now()-7d
 
 ### Filtering Patterns
 \`\`\`dql
+// By service name (entityName resolves the ID to name)
+| filter entityName(dt.entity.service) == "banking-account-service"
+
 // By HTTP method
 | filter span.name == "GET" or span.name == "POST"
 
@@ -2425,6 +2438,8 @@ fetch spans, from:now()-7d
 // By HTTP status code
 | filter http.status_code >= 500
 \`\`\`
+
+> ⚠️ **WRONG:** \`dt.entity.service == "my-service"\` — entity fields hold IDs like \`SERVICE-XXX\`, never names. Use \`entityName(dt.entity.service) == "name"\` instead.
 
 ---
 
@@ -2612,6 +2627,24 @@ Or with \`fieldsAdd\`:
 | fields serviceName, cnt
 \`\`\`
 **Why:** Entity IDs like \`SERVICE-XXXX\` or \`HOST-XXXX\` are meaningless to users. \`entityName()\` works for any entity type: \`entityName(dt.entity.host)\`, \`entityName(dt.entity.process_group_instance)\`, etc.
+
+---
+
+### Entity fields contain IDs, not names — use entityName() in filters
+**Wrong:** \`| filter dt.entity.service == "banking-account-service"\` → matches nothing (field holds \`SERVICE-B4F9C95D2BCCED72\`)
+**Correct:** Use \`entityName()\` to filter by human-readable name:
+\`\`\`
+| filter entityName(dt.entity.service) == "banking-account-service"
+\`\`\`
+Multiple services:
+\`\`\`
+| filter entityName(dt.entity.service) == "service-a" OR entityName(dt.entity.service) == "service-b"
+\`\`\`
+**Also works for hosts:**
+\`\`\`
+| filter entityName(dt.entity.host) == "my-hostname"
+\`\`\`
+**Why:** \`dt.entity.service\`, \`dt.entity.host\`, etc. always contain entity IDs (e.g. \`SERVICE-XXXX\`, \`HOST-XXXX\`), never human-readable names. To filter by name, wrap with \`entityName()\`. To filter by known ID, use the ID directly: \`dt.entity.service == "SERVICE-B4F9C95D2BCCED72"\`.
 
 ---
 

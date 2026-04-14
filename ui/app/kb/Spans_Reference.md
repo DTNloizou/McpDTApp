@@ -91,6 +91,9 @@ fetch spans, from:now()-7d
 
 ### Filtering Patterns
 ```dql
+// By service name (entityName resolves the ID to name)
+| filter entityName(dt.entity.service) == "banking-account-service"
+
 // By HTTP method
 | filter span.name == "GET" or span.name == "POST"
 
@@ -103,6 +106,8 @@ fetch spans, from:now()-7d
 // By HTTP status code
 | filter http.status_code >= 500
 ```
+
+> ⚠️ **WRONG:** `dt.entity.service == "my-service"` — entity fields hold IDs like `SERVICE-XXX`, never names. Use `entityName(dt.entity.service) == "name"` instead.
 
 ---
 

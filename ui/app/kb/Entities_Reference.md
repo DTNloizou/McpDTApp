@@ -123,22 +123,26 @@ SERVICE-XXXX (Primary Service)
 
 ## 🔍 DQL Filters for Entities
 
-### Service Filter
+### Filter by Entity ID (when you know the ID)
 ```dql
 | filter dt.entity.service == "SERVICE-XXXXXXXXXXXX"
-```
-
-### Host Filter
-```dql
 | filter dt.entity.host == "HOST-XXXXXXXXXXXX"
-```
-
-### Process Filter
-```dql
 | filter dt.entity.process_group == "PROCESS_GROUP-XXXXXXXXXXXX"
 ```
 
-### Multiple Entity Filter
+### Filter by Entity Name (PREFERRED — human-readable)
+```dql
+// Use entityName() to filter by name — entity fields always hold IDs, never names
+| filter entityName(dt.entity.service) == "banking-account-service"
+| filter entityName(dt.entity.host) == "my-hostname"
+
+// Multiple entities by name
+| filter entityName(dt.entity.service) == "service-a" OR entityName(dt.entity.service) == "service-b"
+```
+
+> ⚠️ **WRONG:** `dt.entity.service == "my-service-name"` — this will NEVER match because the field contains an ID like `SERVICE-B4F9C95D2BCCED72`, not a name.
+
+### Multiple Entity Filter (by ID)
 ```dql
 | filter dt.entity.service in ("SERVICE-ID1", "SERVICE-ID2", "SERVICE-ID3")
 ```

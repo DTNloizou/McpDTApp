@@ -74,6 +74,24 @@ Or with `fieldsAdd`:
 
 ---
 
+### Entity fields contain IDs, not names — use entityName() in filters
+**Wrong:** `| filter dt.entity.service == "banking-account-service"` → matches nothing (field holds `SERVICE-B4F9C95D2BCCED72`)
+**Correct:** Use `entityName()` to filter by human-readable name:
+```
+| filter entityName(dt.entity.service) == "banking-account-service"
+```
+Multiple services:
+```
+| filter entityName(dt.entity.service) == "service-a" OR entityName(dt.entity.service) == "service-b"
+```
+**Also works for hosts:**
+```
+| filter entityName(dt.entity.host) == "my-hostname"
+```
+**Why:** `dt.entity.service`, `dt.entity.host`, etc. always contain entity IDs (e.g. `SERVICE-XXXX`, `HOST-XXXX`), never human-readable names. To filter by name, wrap with `entityName()`. To filter by known ID, use the ID directly: `dt.entity.service == "SERVICE-B4F9C95D2BCCED72"`.
+
+---
+
 ### Never guess filter values — discover first
 **Wrong:** `fetch spans | filter contains(span.name, "settlement")` — guessing that a business concept appears as a span name
 **Correct workflow:**
