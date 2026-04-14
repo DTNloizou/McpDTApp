@@ -458,10 +458,10 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           .replace(/CUSTOM_INFO\s+MCP\s+Query\s+Execution[^\n]*\n?/g, '')
           // Remove "Query returned no data:" error blocks
           .replace(/Query returned no data:[\s\S]*?(?=\n\n|\n#{1,3}\s|$)/g, '')
-          // Remove inlined result tables (### 📊 Query Results... through the end of the table)
-          .replace(/###\s*📊\s*Query Results[\s\S]*?(?=\n\n(?:#{1,3}\s|\*\*|$))/g, '')
+          // Remove inlined result tables (### 📊 / #### 📊 Query Results... through the end of the table)
+          .replace(/#{1,4}\s*📊\s*Query Results[\s\S]*?(?=\n\n(?:#{1,4}\s|\*\*|$))/g, '')
           // Remove "Query Results (N records):" blocks and their markdown tables
-          .replace(/Query Results\s*\(\d+\s*records?\):[\s\S]*?(?=\n\n(?:#{1,3}\s|\*\*|[A-Z])|$)/g, '')
+          .replace(/(?:#{1,4}\s*)?(?:\*\*)?(?:📊\s*)?Query Results(?:\*\*)?\s*\(\d+\s*records?\):[\s\S]*?(?=\n\n(?:#{1,4}\s|\*\*|[A-Z])|$)/g, '')
           // Remove raw JSON arrays that were inlined as results
           .replace(/\n```json\n[\s\S]*?\n```\n?/g, '\n')
           // Collapse excessive blank lines
@@ -546,8 +546,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             const line = lines[i];
             const trimmed = line.trim();
 
-            // Detect "Query Results (N records):" — start skipping
-            if (/^(\*\*)?Query Results/i.test(trimmed)) {
+            // Detect "Query Results (N records):" in various formats — start skipping
+            if (/^(?:#{1,4}\s*)?(?:\*\*)?(?:📊\s*)?Query Results/i.test(trimmed)) {
               skipping = true;
               continue;
             }
@@ -795,7 +795,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
               const rows = records.slice(0, 30).map((r) =>
                 '| ' + keys.map((k) => {
                   const v = r[k];
-                  return v === null || v === undefined ? '' : String(v);
+                  if (v === null || v === undefined) return '-';
+                  const s = String(v).replace(/\|/g, '∣').replace(/\n/g, ' ');
+                  return s.length > 50 ? s.slice(0, 47) + '...' : s;
                 }).join(' | ') + ' |'
               );
               tableOutput = [header, sep, ...rows].join('\n');
@@ -806,10 +808,10 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           } catch {
             tableOutput = raw.length > 2000 ? raw.slice(0, 2000) + '\n...(truncated)' : raw;
           }
-          insertText = `\n\n**Query Results** (${result.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}`;
+          insertText = `\n\n#### 📊 Query Results (${result.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}`;
         } else {
           const finalErr = result.message || 'No data returned';
-          insertText = `\n\n*Query returned no data: ${finalErr}*`;
+          insertText = `\n\n#### 📊 Query Results (0 records):\n\nNo records returned`;
         }
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : 'Query failed';
@@ -824,7 +826,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
 
   /** Check if recommendation contains any failed or empty queries */
   const hasFailedQueries = (text: string): boolean =>
-    /\*Query returned no data:.*\*|\*Query error:.*\*|\*Retry failed:.*\*|\*Retry error:.*\*|\*\*Query Results\*\*\s*\(0 records\)/.test(text);
+    /\*Query returned no data:.*\*|\*Query error:.*\*|\*Retry failed:.*\*|\*Retry error:.*\*|(?:#{1,4}\s*)?(?:\*\*)?(?:📊\s*)?Query Results(?:\*\*)?\s*\(0 records\)/.test(text);
 
   /**
    * Retry only the failed DQL queries in the recommendation.
@@ -857,8 +859,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         continue;
       }
 
-      // Pattern 2: **Query Results** (0 records):\n\nNo records returned
-      const emptyMatch = after.match(/^\s*\n\n(\*\*Query Results\*\*\s*\(0 records\):?\s*\n\nNo records returned)/);
+      // Pattern 2: **Query Results** or #### 📊 Query Results (0 records):\n\nNo records returned
+      const emptyMatch = after.match(/^\s*\n\n((?:#{1,4}\s*)?(?:\*\*)?(?:📊\s*)?Query Results(?:\*\*)?\s*\(0 records\):?\s*\n\nNo records returned)/);
       if (emptyMatch) {
         const errorStart = blockEnd + emptyMatch.index!;
         const errorEnd = errorStart + emptyMatch[0].length;
@@ -900,7 +902,9 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
               const rows = records.slice(0, 30).map((r) =>
                 '| ' + keys.map((k) => {
                   const v = r[k];
-                  return v === null || v === undefined ? '' : String(v);
+                  if (v === null || v === undefined) return '-';
+                  const s = String(v).replace(/\|/g, '∣').replace(/\n/g, ' ');
+                  return s.length > 50 ? s.slice(0, 47) + '...' : s;
                 }).join(' | ') + ' |'
               );
               tableOutput = [header, sep, ...rows].join('\n');
@@ -914,8 +918,8 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
           const learningNote = addedToLearnings ? '\n\n*📝 Query repaired and added to learnings*' : '';
           // Replace the old code block + error with the fixed code block + results
           const newBlock = fixedDql !== dql
-            ? `\`\`\`dql\n${fixedDql}\n\`\`\`\n\n**Query Results** (${execResult.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}${learningNote}`
-            : result.slice(blockStart, blockEnd) + `\n\n**Query Results** (${execResult.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}`;
+            ? `\`\`\`dql\n${fixedDql}\n\`\`\`\n\n#### 📊 Query Results (${execResult.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}${learningNote}`
+            : result.slice(blockStart, blockEnd) + `\n\n#### 📊 Query Results (${execResult.stats?.recordsReturned ?? '?'} records):\n\n${tableOutput}`;
           result = result.slice(0, blockStart) + newBlock + result.slice(errorEnd);
         } else {
           // Still failed — log and update error message
@@ -953,25 +957,135 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     const now = new Date();
     const title = lastQuery?.label || 'Recommendations';
     const dateStr = now.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+    const timeStr = now.toLocaleTimeString('en-GB');
     const subject = `${title} — ${dateStr}`;
-    const lines: string[] = [
-      `${title}`,
-      `Generated on ${dateStr} at ${now.toLocaleTimeString('en-GB')}`,
-      '',
-    ];
-    if (lastQuery) {
-      lines.push('Query:', lastQuery.dql, '');
-    }
-    // Strip markdown formatting for plain-text email body
-    const plainContent = recommendation.content
-      .replace(/#{1,6}\s/g, '')
-      .replace(/\*\*(.*?)\*\*/g, '$1')
-      .replace(/\*(.*?)\*/g, '$1')
-      .replace(/`{3}[\s\S]*?`{3}/g, (m) => m.replace(/`{3}\w*\n?/g, ''))
-      .replace(/`([^`]+)`/g, '$1');
-    lines.push('AI Recommendations:', '', plainContent);
-    const body = lines.join('\n');
-    window.open(`mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`);
+
+    // Convert markdown to email-safe HTML (Outlook-compatible inline styles)
+    const mdToHtml = (md: string): string => {
+      // Phase 1: Extract code blocks and tables before other processing
+      const tableSlots: string[] = [];
+
+      let out = md
+        // Code blocks → remove from email (DQL queries)
+        .replace(/```(?:\w*)\n[\s\S]*?```/g, '');
+
+      // Markdown tables → Outlook-compatible HTML tables
+      out = out.replace(/((?:^[ \t]*\|.+\|[ \t]*$\n?)+)/gm, (_match, tableBlock: string) => {
+        const lines = tableBlock.trim().split('\n').filter((l: string) => l.trim());
+        if (lines.length < 2) return tableBlock;
+        const parseRow = (line: string) => line.split('|').slice(1, -1).map((c: string) => c.trim());
+        const headers = parseRow(lines[0]);
+        if (headers.length === 0) return tableBlock;
+        const isSep = /^\|[\s\-:]+(\|[\s\-:]+)+\|$/.test(lines[1].trim());
+        const dataStart = isSep ? 2 : 1;
+
+        let tbl = '<table border="1" cellpadding="6" cellspacing="0" width="100%" style="border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif;font-size:13px;margin:8px 0;border:1px solid #d0d0d0;">';
+        tbl += '<tr>';
+        headers.forEach((h: string) => {
+          tbl += `<th bgcolor="#6950A1" style="padding:8px 12px;text-align:left;color:#ffffff;font-weight:600;border:1px solid #5a4090;font-size:13px;">${h.replace(/</g, '&lt;')}</th>`;
+        });
+        tbl += '</tr>';
+        for (let r = dataStart; r < lines.length; r++) {
+          const cells = parseRow(lines[r]);
+          const bg = (r - dataStart) % 2 === 0 ? '#ffffff' : '#f8f7fb';
+          tbl += `<tr bgcolor="${bg}">`;
+          cells.forEach((cell: string) => {
+            const align = /^-?\d[\d,.%]*$/.test(cell.trim()) ? 'right' : 'left';
+            tbl += `<td style="padding:6px 12px;text-align:${align};border:1px solid #d0d0d0;font-size:13px;">${cell.replace(/</g, '&lt;')}</td>`;
+          });
+          tbl += '</tr>';
+        }
+        tbl += '</table>';
+        const idx = tableSlots.length;
+        tableSlots.push(tbl);
+        return `\x00T${idx}\x00`;
+      });
+
+      // Phase 2: Inline markdown
+      // First, collapse blank lines between consecutive bullet or numbered list items
+      out = out
+        .replace(/^(- .+)$\n\n(?=- )/gm, '$1\n')
+        .replace(/^(\d+\. .+)$\n\n(?=\d+\. )/gm, '$1\n');
+
+      out = out
+        // Horizontal rules
+        .replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid #e0e0e0;margin:10px 0;">')
+        // Headers
+        .replace(/^#### (.+)$/gm, '<h4 style="color:#2c2d4d;margin:8px 0 2px;font-size:14px;">$1</h4>')
+        .replace(/^### (.+)$/gm, '<h3 style="color:#2c2d4d;margin:10px 0 2px;font-size:15px;">$1</h3>')
+        .replace(/^## (.+)$/gm, '<h2 style="color:#2c2d4d;margin:12px 0 2px;font-size:16px;border-bottom:1px solid #e0e0e0;padding-bottom:3px;">$1</h2>')
+        .replace(/^# (.+)$/gm, '<h1 style="color:#2c2d4d;margin:0 0 4px;font-size:18px;">$1</h1>')
+        // Numbered lists
+        .replace(/^(\d+)\. (.+)$/gm, '<div style="padding-left:20px;margin:1px 0;"><strong style="color:#6950A1;">$1.</strong> $2</div>')
+        // Bold & italic
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>')
+        // Inline code
+        .replace(/`([^`]+)`/g, '<code style="background:#f0f0f5;padding:1px 5px;border-radius:3px;font-family:Consolas,monospace;font-size:12px;">$1</code>')
+        // Bullet lists
+        .replace(/^- (.+)$/gm, '<li style="margin:1px 0;">$1</li>')
+        .replace(/(<li[^>]*>.*<\/li>\n?)+/g, (list) => `<ul style="margin:2px 0 6px 16px;padding:0;">${list}</ul>`)
+        // Collapse extra newlines and convert to breaks
+        .replace(/\n{3,}/g, '\n')
+        .replace(/\n\n/g, '<br>')
+        .replace(/\n/g, '');
+
+      // Clean up stray breaks around block elements
+      out = out
+        .replace(/<br>\s*(<(?:h[1-4]|hr|div|ul|pre|table))/gi, '$1')
+        .replace(/(<\/(?:h[1-4]|hr|div|ul|pre|table)>)\s*<br>/gi, '$1')
+        .replace(/(<br>){2,}/g, '<br>');
+
+      // Phase 3: Restore protected blocks
+      tableSlots.forEach((block, i) => { out = out.replace(`\x00T${i}\x00`, block); });
+
+      return out;
+    };
+
+    const queryHtml = '';
+
+    const htmlBody = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;color:#2c2d4d;max-width:800px;margin:0 auto;padding:20px;">
+  <div style="border-bottom:3px solid #1496ff;padding-bottom:12px;margin-bottom:16px;">
+    <h1 style="margin:0;color:#2c2d4d;font-size:20px;">⚠️ ${title}</h1>
+    <div style="color:#888;font-size:12px;margin-top:4px;">Generated on ${dateStr} at ${timeStr}</div>
+  </div>
+  ${queryHtml}
+  <div style="margin-top:16px;">
+    <p style="margin:8px 0;">${mdToHtml(recommendation.content)}</p>
+  </div>
+  <div style="margin-top:24px;padding-top:12px;border-top:1px solid #e0e0e0;color:#aaa;font-size:11px;">
+    Generated by Dynatrace MCP App
+  </div>
+</body></html>`;
+
+    // Build .eml file with HTML content
+    const boundary = 'boundary_' + Date.now();
+    const eml = [
+      `Subject: ${subject}`,
+      `MIME-Version: 1.0`,
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      `X-Unsent: 1`,
+      ``,
+      `--${boundary}`,
+      `Content-Type: text/html; charset=utf-8`,
+      `Content-Transfer-Encoding: quoted-printable`,
+      ``,
+      htmlBody,
+      ``,
+      `--${boundary}--`,
+    ].join('\r\n');
+
+    const blob = new Blob([eml], { type: 'message/rfc822' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${title.replace(/[^a-zA-Z0-9_ -]/g, '').trim().replace(/\s+/g, '_')}.eml`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   const handleGetRecommendations = async () => {
@@ -2968,40 +3082,23 @@ function renderMarkdown(text: string): string {
     .replace(/<parameter[\s\S]*?<\/parameter>/g, '')
     .trim();
 
-  // Escape HTML to prevent XSS
-  let html = cleaned
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  // ── Phase 1: Extract code blocks and tables BEFORE HTML escaping ──
+  // Protect them from being mangled by other replacements
 
-  // Code blocks (``` ... ```)
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) =>
-    `<pre style="background:#1e1e2e;color:#cdd6f4;padding:12px;border-radius:8px;overflow-x:auto;font-size:12px;margin:12px 0">${code.trim()}</pre>`
-  );
+  const codeBlocks: string[] = [];
+  const tableBlocks: string[] = [];
 
-  // Inline code
-  html = html.replace(/`([^`]+)`/g, '<code style="background:rgba(105,80,161,0.15);padding:2px 6px;border-radius:4px;font-size:12px;font-family:monospace">$1</code>');
+  // Extract fenced code blocks → placeholders
+  cleaned = cleaned.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
+    const idx = codeBlocks.length;
+    codeBlocks.push(
+      `<pre style="background:#1e1e2e;color:#cdd6f4;padding:12px;border-radius:8px;overflow-x:auto;font-size:12px;margin:8px 0;line-height:1.5">${code.trim().replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>`
+    );
+    return `\x00CODE${idx}\x00`;
+  });
 
-  // Headers with better styling
-  // H1 - major sections with top border
-  html = html.replace(/^# (.+)$/gm, '<div style="font-size:18px;font-weight:700;margin:20px 0 10px;padding-top:16px;border-top:2px solid rgba(105,80,161,0.3)">$1</div>');
-  // H2 - section headers
-  html = html.replace(/^## (.+)$/gm, '<div style="font-size:16px;font-weight:700;margin:18px 0 8px;color:#4a4a6a">$1</div>');
-  // H3 - subsection headers
-  html = html.replace(/^### (.+)$/gm, '<div style="font-size:15px;font-weight:600;margin:14px 0 6px;color:#5a5a7a">$1</div>');
-  // H4 - minor headers
-  html = html.replace(/^#### (.+)$/gm, '<div style="font-size:14px;font-weight:600;margin:10px 0 4px;color:#6a6a8a">$1</div>');
-
-  // Bold + italic
-  html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-  // Horizontal rules
-  html = html.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid rgba(105,80,161,0.2);margin:16px 0"/>');
-
-  // Markdown tables
-  html = html.replace(/((?:^\|.+\|$\n?)+)/gm, (_match, tableBlock: string) => {
+  // Extract markdown tables → placeholders (must happen before escaping)
+  cleaned = cleaned.replace(/((?:^[ \t]*\|.+\|[ \t]*$\n?)+)/gm, (_match, tableBlock: string) => {
     const lines = tableBlock.trim().split('\n').filter((l: string) => l.trim());
     if (lines.length < 2) return tableBlock;
 
@@ -3009,55 +3106,109 @@ function renderMarkdown(text: string): string {
       line.split('|').slice(1, -1).map((c: string) => c.trim());
 
     const headers = parseRow(lines[0]);
+    if (headers.length === 0) return tableBlock;
 
-    // Check if line[1] is separator (|---|---|)
     const isSeparator = /^\|[\s\-:]+(\|[\s\-:]+)+\|$/.test(lines[1].trim());
     const dataStart = isSeparator ? 2 : 1;
 
-    // Detect right-alignment from separator
-    const alignments = isSeparator
-      ? parseRow(lines[1]).map((cell: string) => (cell.trim().endsWith(':') ? 'right' : 'left'))
-      : headers.map(() => 'left');
+    // Auto-detect numeric columns for right-alignment
+    const alignments = headers.map(() => 'left');
+    if (isSeparator) {
+      parseRow(lines[1]).forEach((cell: string, i: number) => {
+        if (cell.trim().endsWith(':')) alignments[i] = 'right';
+      });
+    }
+    if (lines.length > dataStart) {
+      parseRow(lines[dataStart]).forEach((cell: string, i: number) => {
+        if (/^-?\d[\d,.%]*$/.test(cell.trim())) alignments[i] = 'right';
+      });
+    }
 
-    let table = '<div style="overflow-x:auto;margin:12px 0;max-width:100%"><table style="width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed;border-radius:8px;overflow:hidden">';
-
-    // Header
+    let table = '<div style="overflow-x:auto;margin:8px 0;max-width:100%"><table style="width:100%;border-collapse:collapse;font-size:13px;border-radius:8px;overflow:hidden">';
     table += '<thead><tr>';
     headers.forEach((h: string, i: number) => {
-      table += `<th style="padding:10px 12px;text-align:${alignments[i] || 'left'};background:#6950a1;color:#fff;font-weight:600;white-space:nowrap">${h}</th>`;
+      table += `<th style="padding:8px 12px;text-align:${alignments[i]};background:#6950a1;color:#fff;font-weight:600;white-space:nowrap">${h.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</th>`;
     });
-    table += '</tr></thead>';
-
-    // Body
-    table += '<tbody>';
+    table += '</tr></thead><tbody>';
     for (let r = dataStart; r < lines.length; r++) {
       const cells = parseRow(lines[r]);
       const bg = (r - dataStart) % 2 === 0 ? 'transparent' : 'rgba(105,80,161,0.06)';
       table += `<tr style="background:${bg}">`;
       cells.forEach((cell: string, i: number) => {
-        table += `<td style="padding:8px 12px;text-align:${alignments[i] || 'left'};border-bottom:1px solid rgba(0,0,0,0.08);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px" title="${cell.replace(/"/g, '&quot;')}">${cell}</td>`;
+        const escaped = cell.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        table += `<td style="padding:6px 12px;text-align:${alignments[i]};border-bottom:1px solid rgba(0,0,0,0.06);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:250px" title="${escaped.replace(/"/g, '&quot;')}">${escaped}</td>`;
       });
       table += '</tr>';
     }
     table += '</tbody></table></div>';
-    return table;
+
+    const idx = tableBlocks.length;
+    tableBlocks.push(table);
+    return `\x00TABLE${idx}\x00`;
   });
 
-  // Numbered lists (1. item, 2. item, etc.)
-  html = html.replace(/^(\d+)\. (.+)$/gm, '<div style="padding-left:20px;margin:4px 0"><span style="color:#6950a1;font-weight:600;margin-right:6px">$1.</span>$2</div>');
+  // ── Pre-Phase 2: Collapse blank lines between consecutive list items ──
+  cleaned = cleaned.replace(/^(- .+)$\n\n(?=- )/gm, '$1\n');
+  cleaned = cleaned.replace(/^(\d+\. .+)$\n\n(?=\d+\. )/gm, '$1\n');
 
-  // Bullet lists - improved styling
-  html = html.replace(/^[•\-] (.+)$/gm, '<div style="padding-left:20px;margin:4px 0;position:relative"><span style="position:absolute;left:6px;color:#6950a1">•</span>$1</div>');
+  // ── Phase 2: HTML-escape remaining text ──
+  let html = cleaned
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 
-  // Markdown links [text](url) — allow https URLs and relative paths
+  // ── Phase 3: Inline markdown formatting ──
+
+  // Inline code
+  html = html.replace(/`([^`]+)`/g, '<code style="background:rgba(105,80,161,0.15);padding:2px 6px;border-radius:4px;font-size:12px;font-family:monospace">$1</code>');
+
+  // Headers
+  html = html.replace(/^# (.+)$/gm, '<div style="font-size:18px;font-weight:700;margin:16px 0 6px;padding-top:12px;border-top:2px solid rgba(105,80,161,0.3)">$1</div>');
+  html = html.replace(/^## (.+)$/gm, '<div style="font-size:16px;font-weight:700;margin:14px 0 4px;color:#4a4a6a">$1</div>');
+  html = html.replace(/^### (.+)$/gm, '<div style="font-size:15px;font-weight:600;margin:10px 0 4px;color:#5a5a7a">$1</div>');
+  html = html.replace(/^#### (.+)$/gm, '<div style="font-size:14px;font-weight:600;margin:8px 0 2px;color:#6a6a8a">$1</div>');
+
+  // Bold + italic
+  html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+  // Horizontal rules
+  html = html.replace(/^---+$/gm, '<hr style="border:none;border-top:1px solid rgba(105,80,161,0.2);margin:12px 0"/>');
+
+  // Numbered lists
+  html = html.replace(/^(\d+)\. (.+)$/gm, '<div style="padding-left:20px;margin:2px 0"><span style="color:#6950a1;font-weight:600;margin-right:6px">$1.</span>$2</div>');
+
+  // Bullet lists
+  html = html.replace(/^[•\-] (.+)$/gm, '<div style="padding-left:20px;margin:2px 0;position:relative"><span style="position:absolute;left:6px;color:#6950a1">•</span>$1</div>');
+
+  // Markdown links
   html = html.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');
 
-  // Bare URLs (not already in an <a> tag)
-  html = html.replace(/(?<!href="|&gt;)(https?:\/\/[^\s<&]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');
+  // Bare URLs
+  html = html.replace(/(?<!href="|&amp;gt;)(https?:\/\/[^\s<&]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer" style="color:#1496ff;text-decoration:underline">$1</a>');
 
-  // Line breaks (double newline = paragraph, single = br)
-  html = html.replace(/\n\n/g, '<div style="height:12px"></div>');
+  // ── Phase 4: Line breaks — tighter spacing ──
+  // Collapse 3+ newlines to 2
+  html = html.replace(/\n{3,}/g, '\n\n');
+  // Double newline = small gap (only if not adjacent to a block element)
+  html = html.replace(/\n\n/g, '<div style="height:6px"></div>');
+  // Single newline = line break
   html = html.replace(/\n/g, '<br/>');
+
+  // Clean stray breaks/spacers adjacent to block elements
+  html = html.replace(/<br\/>\s*(<(?:div|pre|hr|table))/gi, '$1');
+  html = html.replace(/(<\/(?:div|pre|hr|table)>)\s*<br\/>/gi, '$1');
+  html = html.replace(/<div style="height:6px"><\/div>\s*(<(?:div|pre|hr|table))/gi, '$1');
+  html = html.replace(/(<\/(?:div|pre|hr|table)>)\s*<div style="height:6px"><\/div>/gi, '$1');
+
+  // ── Phase 5: Restore protected blocks ──
+  codeBlocks.forEach((block, i) => {
+    html = html.replace(`\x00CODE${i}\x00`, block);
+  });
+  tableBlocks.forEach((block, i) => {
+    html = html.replace(`\x00TABLE${i}\x00`, block);
+  });
 
   return html;
 }

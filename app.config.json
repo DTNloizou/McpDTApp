@@ -2,7 +2,7 @@
   "environmentUrl": "https://bfs7010h.sprint.apps.dynatracelabs.com/",
   "app": {
     "name": "Dynatrace MCP",
-    "version": "1.5.6",
+    "version": "1.5.8",
     "description": "Query remote MCP servers from within Dynatrace",
     "id": "my.dynatrace.mcp",
     "scopes": [
