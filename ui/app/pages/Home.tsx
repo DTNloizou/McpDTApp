@@ -2473,7 +2473,7 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
         </div>
 
         <div style={{ padding: '12px 16px', borderTop: '1px solid var(--dt-colors-border-neutral-default, #e0e0e0)', display: 'flex', gap: 8, alignItems: 'flex-end' }}>
-          {getDocumentFileRefs().length > 0 && (
+          {loadConfig().llmProvider === 'anthropic' && getDocumentFileRefs().length > 0 && (
             <span title="Knowledge base documents attached via file references" style={{ fontSize: 18, padding: '6px 4px', opacity: 0.6 }}>📎</span>
           )}
           <textarea
@@ -2620,9 +2620,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
             <button onClick={() => { setCustomCategories(getCustomCategories()); setViewMode('queries'); }} style={{ ...modeBtnStyle, background: '#B36305' }}>
               📋 Pre-Built Queries
             </button>
-            <button onClick={() => { setKbDocs(getKBDocuments()); setViewMode('kb'); }} style={{ ...modeBtnStyle, background: '#6950a1' }}>
-              📄 Knowledge Base{kbDocs.length > 0 ? ` (${kbDocs.length})` : ''}
-            </button>
+            {loadConfig().llmProvider === 'anthropic' && (
+              <button onClick={() => { setKbDocs(getKBDocuments()); setViewMode('kb'); }} style={{ ...modeBtnStyle, background: '#6950a1' }}>
+                📄 Knowledge Base{kbDocs.length > 0 ? ` (${kbDocs.length})` : ''}
+              </button>
+            )}
             <button onClick={() => { setHistoryEntries(getHistory()); setViewMode('history'); }} style={{ ...modeBtnStyle, background: '#0098D4' }}>
               🕒 History{historyEntries.length > 0 ? ` (${historyEntries.length})` : ''}
             </button>

@@ -215,6 +215,9 @@ export async function sendChat(
         }
       }
 
+      // DQL lessons are already embedded inline in the system prompt below
+      // (full KB docs are too large for GitHub Models' 8K token limit)
+
       const systemPrompt = isLowBudget
         ? [
             'Dynatrace SRE assistant. Use execute_dql tool to query real data.',
@@ -252,10 +255,25 @@ export async function sendChat(
             'For services: fetch dt.entity.service',
             '',
             'DQL SYNTAX RULES:',
-            '- Group-by: summarize count(), by:{fieldName}',
-            '- contains() is a FUNCTION: contains(fieldName, "value")',
-            '- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)}',
-            '- Math: round(value, decimals:2), explicit *: (a / b) * 100',
+            '- Group-by uses CURLY BRACES: summarize count(), by:{fieldName} — NOT by:fieldName',
+            '- Multiple group-by: summarize count(), by:{field1, field2}',
+            '- contains() is a FUNCTION: contains(fieldName, "value") — NOT fieldName contains "value"',
+            '- Time bucketing: summarize count(), by:{time = bin(timestamp, 1h)} — ALWAYS alias bin()',
+            '- Math: round(value, decimals:2) — NOT round(value, 2). Explicit *: (a / b) * 100',
+            '- countIf() NOT count_if() — e.g. countIf(status_code >= 500)',
+            '- fieldsAdd NOT compute — e.g. fieldsAdd pct = round(toDouble(a)/toDouble(b)*100, decimals:2)',
+            '- toDouble() for arithmetic on aggregated fields',
+            '- sort by alias: summarize cnt=count() ... sort cnt desc — NEVER sort count() desc',
+            '',
+            'ENTITY FIELD RULES (CRITICAL):',
+            '- dt.entity.service, dt.entity.host hold IDs like SERVICE-XXX, NEVER human names',
+            '- NEVER write dt.entity.service == "service-name" — it ALWAYS returns 0 records',
+            '- Filter by name: fieldsAdd serviceName = entityName(dt.entity.service) | filter serviceName == "my-service"',
+            '- Display names: fieldsAdd serviceName = entityName(dt.entity.service) after summarize',
+            '- timeseries by:{} only accepts plain fields — use fieldsAdd entityName() AFTER timeseries, not inside by:{}',
+            '',
+            'SPAN COST: fetch spans is EXPENSIVE. Use from:now()-1h or from:now()-2h MAX.',
+            'For 7d+ trends use timeseries (FREE). NEVER fetch spans from:now()-7d unless summarize with limit.',
             '',
             'If a query fails, try a simpler version. Do not keep retrying similar syntax.',
             'Format DQL in ```dql code blocks.',
