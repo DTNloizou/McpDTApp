@@ -70,9 +70,9 @@ const CATEGORIES: Category[] = [
     emoji: '⚙️',
     color: '#0098D4',
     queries: [
-      { label: 'Service Error Rates', emoji: '⚠️', query: 'fetch spans, from:now()-1h | filter http.response.status_code >= 500 | summarize errorCount = count(), by:{serviceName = entityName(dt.entity.service)} | sort errorCount desc | limit 10' },
-      { label: 'Slowest Services', emoji: '🐢', query: 'fetch spans, from:now()-1h | summarize avgDuration = avg(duration), by:{serviceName = entityName(dt.entity.service)} | sort avgDuration desc | limit 10' },
-      { label: 'Throughput by Service', emoji: '📈', query: 'fetch spans, from:now()-1h | summarize requestCount = count(), by:{serviceName = entityName(dt.entity.service)} | sort requestCount desc | limit 10' },
+      { label: 'Service Error Rates', emoji: '⚠️', query: 'fetch spans, from:now()-1h | filter http.response.status_code >= 500 | summarize errorCount = count(), by:{dt.entity.service} | fieldsAdd serviceName = entityName(dt.entity.service) | fields serviceName, errorCount | sort errorCount desc | limit 10' },
+      { label: 'Slowest Services', emoji: '🐢', query: 'fetch spans, from:now()-1h | summarize avgDuration = avg(duration), by:{dt.entity.service} | fieldsAdd serviceName = entityName(dt.entity.service) | fields serviceName, avgDuration | sort avgDuration desc | limit 10' },
+      { label: 'Throughput by Service', emoji: '📈', query: 'fetch spans, from:now()-1h | summarize requestCount = count(), by:{dt.entity.service} | fieldsAdd serviceName = entityName(dt.entity.service) | fields serviceName, requestCount | sort requestCount desc | limit 10' },
     ],
   },
   {
@@ -103,9 +103,9 @@ const CATEGORIES: Category[] = [
     emoji: '💻',
     color: '#A0A5A9',
     queries: [
-      { label: 'Host CPU Usage', emoji: '🔥', query: 'timeseries avg(dt.host.cpu.usage), by:{hostName = entityName(dt.entity.host)} | limit 10' },
-      { label: 'Host Memory', emoji: '🧠', query: 'timeseries avg(dt.host.memory.usage), by:{hostName = entityName(dt.entity.host)} | limit 10' },
-      { label: 'Disk Usage', emoji: '💾', query: 'timeseries avg(dt.host.disk.usage), by:{hostName = entityName(dt.entity.host)} | limit 10' },
+      { label: 'Host CPU Usage', emoji: '🔥', query: 'timeseries avg(dt.host.cpu.usage), by:{dt.entity.host} | fieldsAdd hostName = entityName(dt.entity.host)' },
+      { label: 'Host Memory', emoji: '🧠', query: 'timeseries avg(dt.host.memory.usage), by:{dt.entity.host} | fieldsAdd hostName = entityName(dt.entity.host)' },
+      { label: 'Disk Usage', emoji: '💾', query: 'timeseries avg(dt.host.disk.usage), by:{dt.entity.host} | fieldsAdd hostName = entityName(dt.entity.host)' },
       { label: 'Recent Logs', emoji: '📋', query: 'fetch logs, from:now()-15m | summarize count(), by:{status} | sort `count()` desc' },
     ],
   },

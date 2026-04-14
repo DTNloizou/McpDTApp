@@ -47,14 +47,14 @@ When grouping by or displaying `dt.entity.service`, `dt.entity.host`, or any ent
 ```
 Outputs: `SERVICE-B4F9C95D2BCCED72 | 1504`
 
-**Correct — inline with fieldsAdd:**
+**Correct — fieldsAdd after summarize (SAFEST — works everywhere):**
 ```
 | summarize cnt = count(), by:{dt.entity.service}
 | fieldsAdd serviceName = entityName(dt.entity.service)
 | fields serviceName, cnt
 ```
 
-**Correct — inline in by:{}:**
+**Correct — inline in by:{} (works in fetch, NOT in timeseries):**
 ```
 | summarize cnt = count(), by:{serviceName = entityName(dt.entity.service)}
 ```
@@ -64,6 +64,63 @@ Outputs: `banking-transaction-service | 1504`
 - `entityName(dt.entity.service)` → service name
 - `entityName(dt.entity.host)` → host name
 - `entityName(dt.entity.process_group_instance)` → process group name
+
+---
+
+### CRITICAL: Entity fields hold IDs, NEVER human names — use entityName() to filter
+
+`dt.entity.service` contains an ID like `SERVICE-B4F9C95D2BCCED72`, **never** a human name like `banking-account-service`.
+Filtering `dt.entity.service == "banking-account-service"` will **always return 0 records**.
+
+**Wrong — will NEVER match:**
+```
+| filter dt.entity.service == "banking-account-service"
+```
+
+**Correct — use fieldsAdd + filter (SAFEST, works everywhere):**
+```
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| filter serviceName == "banking-account-service"
+```
+
+**Correct — entityName() directly in filter (works in fetch, NOT in timeseries):**
+```
+| filter entityName(dt.entity.service) == "banking-account-service"
+```
+
+**Multiple services:**
+```
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| filter serviceName == "service-a" OR serviceName == "service-b"
+```
+
+**Hosts:**
+```
+| fieldsAdd hostName = entityName(dt.entity.host)
+| filter hostName == "my-hostname"
+```
+
+**By known ID (if you already have the entity ID):**
+```
+| filter dt.entity.service == "SERVICE-B4F9C95D2BCCED72"
+```
+
+---
+
+### CRITICAL: entityName() does NOT work inside timeseries by:{}
+
+`timeseries` only accepts plain field identifiers in `by:{}`. Use `fieldsAdd` after.
+
+**Wrong — syntax error:**
+```
+timeseries avg(dt.host.cpu.usage), by:{hostName = entityName(dt.entity.host)}
+```
+
+**Correct — fieldsAdd after timeseries:**
+```
+timeseries avg(dt.host.cpu.usage), by:{dt.entity.host}
+| fieldsAdd hostName = entityName(dt.entity.host)
+```
 
 ---
 
@@ -391,21 +448,25 @@ fetch dt.davis.problems, from:now()-7d
 ### CPU usage over time
 ```dql
 timeseries avg_cpu = avg(dt.host.cpu.usage), from:now()-2h, by:{dt.entity.host}
+| fieldsAdd hostName = entityName(dt.entity.host)
 ```
 
 ### Memory usage over time
 ```dql
 timeseries mem = avg(dt.host.memory.usage), from:now()-2h, by:{dt.entity.host}
+| fieldsAdd hostName = entityName(dt.entity.host)
 ```
 
 ### Disk usage
 ```dql
 timeseries disk = avg(dt.host.disk.usage), from:now()-2h, by:{dt.entity.host}
+| fieldsAdd hostName = entityName(dt.entity.host)
 ```
 
 ### Network traffic
 ```dql
 timeseries bytesin = sum(dt.host.network.nic.traffic.in), from:now()-2h, by:{dt.entity.host}
+| fieldsAdd hostName = entityName(dt.entity.host)
 ```
 
 ---
@@ -459,13 +520,29 @@ fieldsAdd durationMs = round(toDouble(duration) / 1000000.0, decimals:2)
 ```
 
 ### entityName() to resolve entity IDs
-Use `entityName()` to convert entity IDs to human-readable names. Works inline:
+Entity fields (dt.entity.service, dt.entity.host) hold IDs like `SERVICE-XXX`, NEVER names.
+Use `entityName()` to convert to human-readable names.
+
+**Display names (fieldsAdd — works everywhere including timeseries):**
 ```dql
 | fieldsAdd serviceName = entityName(dt.entity.service)
 ```
-Or directly in `by:{}`:
+
+**Filter by name (fieldsAdd + filter — SAFEST):**
 ```dql
-| summarize cnt = count(), by:{serviceName = entityName(dt.entity.service)}
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| filter serviceName == "banking-account-service"
+```
+
+**WRONG — will NEVER match (entity field holds an ID, not a name):**
+```dql
+| filter dt.entity.service == "banking-account-service"
+```
+
+**timeseries: entityName() does NOT work in by:{}. Use fieldsAdd after:**
+```dql
+timeseries avg(dt.host.cpu.usage), by:{dt.entity.host}
+| fieldsAdd hostName = entityName(dt.entity.host)
 ```
 
 ### lookup syntax (for advanced joins)

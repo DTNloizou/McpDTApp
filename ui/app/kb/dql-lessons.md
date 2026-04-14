@@ -74,21 +74,39 @@ Or with `fieldsAdd`:
 
 ---
 
-### Entity fields contain IDs, not names — use entityName() in filters
-**Wrong:** `| filter dt.entity.service == "banking-account-service"` → matches nothing (field holds `SERVICE-B4F9C95D2BCCED72`)
-**Correct:** Use `entityName()` to filter by human-readable name:
+### Entity fields contain IDs, not names — use entityName() to filter
+**Wrong:** `| filter dt.entity.service == "banking-account-service"` → matches NOTHING (field holds `SERVICE-B4F9C95D2BCCED72`)
+**Correct (SAFEST — fieldsAdd + filter):**
+```
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| filter serviceName == "banking-account-service"
+```
+**Also correct (entityName in filter — works in fetch, NOT timeseries):**
 ```
 | filter entityName(dt.entity.service) == "banking-account-service"
 ```
-Multiple services:
+**Multiple services:**
 ```
-| filter entityName(dt.entity.service) == "service-a" OR entityName(dt.entity.service) == "service-b"
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| filter serviceName == "service-a" OR serviceName == "service-b"
 ```
 **Also works for hosts:**
 ```
-| filter entityName(dt.entity.host) == "my-hostname"
+| fieldsAdd hostName = entityName(dt.entity.host)
+| filter hostName == "my-hostname"
 ```
-**Why:** `dt.entity.service`, `dt.entity.host`, etc. always contain entity IDs (e.g. `SERVICE-XXXX`, `HOST-XXXX`), never human-readable names. To filter by name, wrap with `entityName()`. To filter by known ID, use the ID directly: `dt.entity.service == "SERVICE-B4F9C95D2BCCED72"`.
+**Why:** `dt.entity.service`, `dt.entity.host`, etc. ALWAYS contain entity IDs (e.g. `SERVICE-XXXX`, `HOST-XXXX`), NEVER human-readable names. To filter by name, use `fieldsAdd` with `entityName()` then filter on the alias. To filter by known ID, use the ID directly: `dt.entity.service == "SERVICE-B4F9C95D2BCCED72"`.
+
+---
+
+### entityName() does NOT work inside timeseries by:{}
+**Wrong:** `timeseries avg(dt.host.cpu.usage), by:{hostName = entityName(dt.entity.host)}` → SYNTAX ERROR
+**Correct:**
+```
+timeseries avg(dt.host.cpu.usage), by:{dt.entity.host}
+| fieldsAdd hostName = entityName(dt.entity.host)
+```
+**Why:** `timeseries by:{}` only accepts plain field identifiers. Use `fieldsAdd` after `timeseries` to resolve entity names. This also applies to `timeseries filter:{}` — use the raw entity ID there, not `entityName()`.
 
 ---
 
