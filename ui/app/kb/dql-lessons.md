@@ -59,6 +59,21 @@ After aliasing, use `sort time` not `sort timestamp`.
 
 ---
 
+### Never output raw entity IDs — always resolve to names
+**Wrong:** `| summarize cnt = count(), by:{dt.entity.service}` → outputs `SERVICE-B4F9C95D2BCCED72`
+**Correct:** Use `entityName()` to resolve IDs inline:
+```
+| summarize cnt = count(), by:{serviceName = entityName(dt.entity.service)}
+```
+Or with `fieldsAdd`:
+```
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| fields serviceName, cnt
+```
+**Why:** Entity IDs like `SERVICE-XXXX` or `HOST-XXXX` are meaningless to users. `entityName()` works for any entity type: `entityName(dt.entity.host)`, `entityName(dt.entity.process_group_instance)`, etc.
+
+---
+
 ### Never guess filter values — discover first
 **Wrong:** `fetch spans | filter contains(span.name, "settlement")` — guessing that a business concept appears as a span name
 **Correct workflow:**

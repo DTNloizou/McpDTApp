@@ -825,6 +825,37 @@ Logs and bizevents use \`timestamp\` normally.
 
 ---
 
+### CRITICAL: Never output raw entity IDs
+
+Entity IDs like \`SERVICE-B4F9C95D2BCCED72\` or \`HOST-24B49251EA1EE742\` are meaningless to users.
+When grouping by or displaying \`dt.entity.service\`, \`dt.entity.host\`, or any entity field, **always** use \`entityName()\` to resolve to the human-readable name.
+
+**Wrong:**
+\`\`\`
+| summarize cnt = count(), by:{dt.entity.service}
+\`\`\`
+Outputs: \`SERVICE-B4F9C95D2BCCED72 | 1504\`
+
+**Correct — inline with fieldsAdd:**
+\`\`\`
+| summarize cnt = count(), by:{dt.entity.service}
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| fields serviceName, cnt
+\`\`\`
+
+**Correct — inline in by:{}:**
+\`\`\`
+| summarize cnt = count(), by:{serviceName = entityName(dt.entity.service)}
+\`\`\`
+Outputs: \`banking-transaction-service | 1504\`
+
+\`entityName()\` works for any entity type:
+- \`entityName(dt.entity.service)\` → service name
+- \`entityName(dt.entity.host)\` → host name
+- \`entityName(dt.entity.process_group_instance)\` → process group name
+
+---
+
 ## Entity Queries (FREE — no data cost)
 
 ### List all services
@@ -878,6 +909,7 @@ fetch spans, from:now()-2h
 ### Error rate by endpoint
 \`\`\`dql
 fetch spans, from:now()-2h
+| filter span.kind == "server"
 | summarize cnt = count(), errors = countIf(http.response.status_code >= 400), by:{span.name}
 | fieldsAdd errorRate = round(toDouble(errors) * 100.0 / toDouble(cnt), decimals:1)
 | sort errors desc
@@ -909,12 +941,13 @@ fetch spans, from:now()-2h
 | sort time asc
 \`\`\`
 
-### Filter spans by service entity ID
+### Filter spans by service name
 \`\`\`dql
 fetch spans, from:now()-1h
 | filter span.kind == "server"
-| filter dt.entity.service == "SERVICE-XXXXXXXXXXXXXXXX"
-| summarize cnt = count(), avgDuration = avg(duration), by:{span.name}
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| filter serviceName == "banking-transaction-service"
+| summarize cnt = count(), avgDuration = avg(duration), by:{span.name, serviceName}
 | sort cnt desc
 \`\`\`
 
@@ -935,7 +968,8 @@ fetch spans, from:now()-1h
 | filter span.kind == "server"
 | fieldsAdd statusStr = toString(http.response.status_code)
 | filter matchesValue(statusStr, "5*")
-| fields start_time, span.name, http.response.status_code, duration, dt.entity.service
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| fields start_time, span.name, http.response.status_code, duration, serviceName
 | sort start_time desc
 | limit 10
 \`\`\`
@@ -945,11 +979,12 @@ fetch spans, from:now()-1h
 fetch spans, from:now()-1h
 | filter span.kind == "server"
 | summarize cnt = count(), errors = countIf(http.response.status_code >= 400),
-    by:{dt.entity.service}
+    by:{serviceName = entityName(dt.entity.service)}
 | fieldsAdd errorRate = round(toDouble(errors) * 100.0 / toDouble(cnt), decimals:1)
 | fieldsAdd health = if(errorRate >= 50.0, "CRITICAL",
     else:if(errorRate > 0.0, "WARNING",
     else:"HEALTHY"))
+| fields serviceName, cnt, errors, errorRate, health
 | sort errorRate desc
 \`\`\`
 
@@ -964,16 +999,14 @@ fetch spans, from:now()-1h
 | limit 10
 \`\`\`
 
-### Throughput per service with lookup for names
-Resolve service entity IDs to human-readable names.
+### Throughput per service
 \`\`\`dql
 fetch spans, from:now()-1h
 | filter span.kind == "server"
-| summarize cnt = count(), avgDuration = avg(duration), by:{dt.entity.service}
-| lookup [fetch dt.entity.service | fields id, entity.name],
-    sourceField:dt.entity.service, lookupField:id, prefix:"svc."
-| fields svc.entity.name, cnt,
-    avgResponseMs = round(toDouble(avgDuration) / 1000000.0, decimals:1)
+| summarize cnt = count(), avgDuration = avg(duration),
+    by:{serviceName = entityName(dt.entity.service)}
+| fieldsAdd avgResponseMs = round(toDouble(avgDuration) / 1000000.0, decimals:1)
+| fields serviceName, cnt, avgResponseMs
 | sort cnt desc
 \`\`\`
 
@@ -982,10 +1015,8 @@ fetch spans, from:now()-1h
 fetch spans, from:now()-1h
 | filter span.kind == "server"
 | summarize cnt = count(), endpoints = collectDistinct(span.name),
-    by:{dt.entity.service}
-| lookup [fetch dt.entity.service | fields id, entity.name],
-    sourceField:dt.entity.service, lookupField:id, prefix:"svc."
-| fields svc.entity.name, cnt, endpoints
+    by:{serviceName = entityName(dt.entity.service)}
+| fields serviceName, cnt, endpoints
 | sort cnt desc
 \`\`\`
 
@@ -1012,7 +1043,8 @@ fetch logs, from:now()-2h
 \`\`\`dql
 fetch logs, from:now()-1h
 | filter loglevel == "ERROR"
-| fields timestamp, content, loglevel, log.source, dt.entity.host
+| fieldsAdd hostName = entityName(dt.entity.host)
+| fields timestamp, content, loglevel, log.source, hostName
 | sort timestamp desc
 | limit 10
 \`\`\`
@@ -1038,7 +1070,7 @@ fetch logs, from:now()-2h
 ### Log volume by host
 \`\`\`dql
 fetch logs, from:now()-2h
-| summarize cnt = count(), by:{dt.entity.host}
+| summarize cnt = count(), by:{hostName = entityName(dt.entity.host)}
 | sort cnt desc
 | limit 10
 \`\`\`
@@ -1110,7 +1142,9 @@ fetch events, from:now()-24h
 \`\`\`dql
 fetch events, from:now()-24h
 | filter event.kind == "DAVIS_EVENT"
-| fields timestamp, event.name, event.type, event.status, dt.entity.host, dt.entity.service
+| fieldsAdd hostName = entityName(dt.entity.host),
+    serviceName = entityName(dt.entity.service)
+| fields timestamp, event.name, event.type, event.status, hostName, serviceName
 | sort timestamp desc
 | limit 10
 \`\`\`
@@ -1213,12 +1247,23 @@ Span \`duration\` field is in nanoseconds. Divide by 1,000,000 for milliseconds:
 fieldsAdd durationMs = round(toDouble(duration) / 1000000.0, decimals:2)
 \`\`\`
 
-### lookup syntax
+### entityName() to resolve entity IDs
+Use \`entityName()\` to convert entity IDs to human-readable names. Works inline:
 \`\`\`dql
-| lookup [fetch dt.entity.service | fields id, entity.name],
+| fieldsAdd serviceName = entityName(dt.entity.service)
+\`\`\`
+Or directly in \`by:{}\`:
+\`\`\`dql
+| summarize cnt = count(), by:{serviceName = entityName(dt.entity.service)}
+\`\`\`
+
+### lookup syntax (for advanced joins)
+Use \`lookup\` when you need to join additional entity fields beyond the name:
+\`\`\`dql
+| lookup [fetch dt.entity.service | fields id, entity.name, tags],
     sourceField:dt.entity.service, lookupField:id, prefix:"svc."
 \`\`\`
-After lookup, access joined fields with the prefix: \`svc.entity.name\`.
+After lookup, access joined fields with the prefix: \`svc.entity.name\`, \`svc.tags\`.
 
 ### matchesValue for wildcard patterns
 \`\`\`dql
@@ -2552,6 +2597,21 @@ After aliasing, use \`sort time\` not \`sort timestamp\`.
 ### round() uses named parameter
 **Wrong:** \`round(value, 2)\`
 **Correct:** \`round(value, decimals:2)\`
+
+---
+
+### Never output raw entity IDs — always resolve to names
+**Wrong:** \`| summarize cnt = count(), by:{dt.entity.service}\` → outputs \`SERVICE-B4F9C95D2BCCED72\`
+**Correct:** Use \`entityName()\` to resolve IDs inline:
+\`\`\`
+| summarize cnt = count(), by:{serviceName = entityName(dt.entity.service)}
+\`\`\`
+Or with \`fieldsAdd\`:
+\`\`\`
+| fieldsAdd serviceName = entityName(dt.entity.service)
+| fields serviceName, cnt
+\`\`\`
+**Why:** Entity IDs like \`SERVICE-XXXX\` or \`HOST-XXXX\` are meaningless to users. \`entityName()\` works for any entity type: \`entityName(dt.entity.host)\`, \`entityName(dt.entity.process_group_instance)\`, etc.
 
 ---
 
