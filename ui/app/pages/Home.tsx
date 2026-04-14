@@ -61,7 +61,7 @@ const CATEGORIES: Category[] = [
     queries: [
       { label: 'Active Problems', emoji: '🚨', query: 'fetch events, from:now()-24h | filter event.kind == "DAVIS_PROBLEM" | filter event.status == "ACTIVE" | fields timestamp, display_id, title, event.status | sort timestamp desc | limit 20' },
       { label: 'Problem History (7d)', emoji: '📊', query: 'fetch events, from:now()-7d | filter event.kind == "DAVIS_PROBLEM" | summarize problemCount = count(), by:{event.status} | sort problemCount desc' },
-      { label: 'Impacted Services', emoji: '🔗', query: 'fetch events, from:now()-24h | filter event.kind == "DAVIS_PROBLEM" | filter event.status == "ACTIVE" | fields title, affected_entity_ids, root_cause_entity_id | limit 20' },
+      { label: 'Impacted Services', emoji: '🔗', query: 'fetch events, from:now()-24h | filter event.kind == "DAVIS_PROBLEM" | filter event.status == "ACTIVE" | fields title, affected_entity_names, root_cause_entity_name | limit 20' },
     ],
   },
   {
@@ -70,9 +70,9 @@ const CATEGORIES: Category[] = [
     emoji: '⚙️',
     color: '#0098D4',
     queries: [
-      { label: 'Service Error Rates', emoji: '⚠️', query: 'fetch spans, from:now()-1h | filter http.response.status_code >= 500 | summarize errorCount = count(), by:{dt.entity.service} | sort errorCount desc | limit 10' },
-      { label: 'Slowest Services', emoji: '🐢', query: 'fetch spans, from:now()-1h | summarize avgDuration = avg(duration), by:{dt.entity.service} | sort avgDuration desc | limit 10' },
-      { label: 'Throughput by Service', emoji: '📈', query: 'fetch spans, from:now()-1h | summarize requestCount = count(), by:{dt.entity.service} | sort requestCount desc | limit 10' },
+      { label: 'Service Error Rates', emoji: '⚠️', query: 'fetch spans, from:now()-1h | filter http.response.status_code >= 500 | summarize errorCount = count(), by:{serviceName = entityName(dt.entity.service)} | sort errorCount desc | limit 10' },
+      { label: 'Slowest Services', emoji: '🐢', query: 'fetch spans, from:now()-1h | summarize avgDuration = avg(duration), by:{serviceName = entityName(dt.entity.service)} | sort avgDuration desc | limit 10' },
+      { label: 'Throughput by Service', emoji: '📈', query: 'fetch spans, from:now()-1h | summarize requestCount = count(), by:{serviceName = entityName(dt.entity.service)} | sort requestCount desc | limit 10' },
     ],
   },
   {
@@ -103,9 +103,9 @@ const CATEGORIES: Category[] = [
     emoji: '💻',
     color: '#A0A5A9',
     queries: [
-      { label: 'Host CPU Usage', emoji: '🔥', query: 'timeseries avg(dt.host.cpu.usage), by:{dt.entity.host} | limit 10' },
-      { label: 'Host Memory', emoji: '🧠', query: 'timeseries avg(dt.host.memory.usage), by:{dt.entity.host} | limit 10' },
-      { label: 'Disk Usage', emoji: '💾', query: 'timeseries avg(dt.host.disk.usage), by:{dt.entity.host} | limit 10' },
+      { label: 'Host CPU Usage', emoji: '🔥', query: 'timeseries avg(dt.host.cpu.usage), by:{hostName = entityName(dt.entity.host)} | limit 10' },
+      { label: 'Host Memory', emoji: '🧠', query: 'timeseries avg(dt.host.memory.usage), by:{hostName = entityName(dt.entity.host)} | limit 10' },
+      { label: 'Disk Usage', emoji: '💾', query: 'timeseries avg(dt.host.disk.usage), by:{hostName = entityName(dt.entity.host)} | limit 10' },
       { label: 'Recent Logs', emoji: '📋', query: 'fetch logs, from:now()-15m | summarize count(), by:{status} | sort `count()` desc' },
     ],
   },
@@ -125,7 +125,7 @@ const CATEGORIES: Category[] = [
       { label: 'Top ISPs', emoji: '📡', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), avgDuration = avg(duration), errorRate = round(toDouble(countIf(error.count > 0)) / toDouble(count()) * 100, decimals:2), by:{client.isp} | sort sessions desc | limit 10' },
       { label: 'JS Errors (Events)', emoji: '⚠️', query: 'fetch user.events, from:now()-24h | filter error.type != "" | summarize errorCount = count(), by:{error.type, error.message} | sort errorCount desc | limit 15' },
       { label: 'Page Load Actions', emoji: '📄', query: 'fetch user.events, from:now()-24h | filter navigation.type != "" | summarize pageLoads = count(), by:{navigation.type, page.source.url.full} | sort pageLoads desc | limit 15' },
-      { label: 'Session Trend (Hourly)', emoji: '📈', query: 'fetch user.sessions, from:now()-24h | summarize sessions = count(), by:{bin(timestamp, 1h)} | sort `bin(timestamp, 1h)` asc' },
+      { label: 'Session Trend (Hourly)', emoji: '📈', query: 'fetch user.sessions, from:now()-24h | summarize sessions = count(), by:{time = bin(timestamp, 1h)} | sort time asc' },
       { label: 'Screen Resolutions', emoji: '🖥️', query: 'fetch user.sessions, from:now()-7d | summarize sessions = count(), by:{device.screen.width, device.screen.height} | sort sessions desc | limit 10' },
     ],
   },
