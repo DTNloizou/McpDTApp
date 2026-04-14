@@ -948,30 +948,30 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
     }).catch(() => {/* best-effort */});
   };
 
-  const handleExportRecommendationsMd = () => {
+  const handleEmailRecommendations = () => {
     if (!recommendation || recommendation.role !== 'assistant') return;
     const now = new Date();
-    const stamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const title = lastQuery?.label || 'Recommendations';
+    const dateStr = now.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+    const subject = `${title} — ${dateStr}`;
     const lines: string[] = [
-      `# ${title}`,
-      '',
-      `> Exported on ${now.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })} at ${now.toLocaleTimeString('en-GB')}`,
+      `${title}`,
+      `Generated on ${dateStr} at ${now.toLocaleTimeString('en-GB')}`,
       '',
     ];
     if (lastQuery) {
-      lines.push('## Query', '', '```dql', lastQuery.dql, '```', '');
+      lines.push('Query:', lastQuery.dql, '');
     }
-    lines.push('## AI Recommendations', '', recommendation.content, '');
-    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${title.replace(/[^a-zA-Z0-9_ -]/g, '').trim().replace(/\s+/g, '_')}_${stamp}.md`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    // Strip markdown formatting for plain-text email body
+    const plainContent = recommendation.content
+      .replace(/#{1,6}\s/g, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\*(.*?)\*/g, '$1')
+      .replace(/`{3}[\s\S]*?`{3}/g, (m) => m.replace(/`{3}\w*\n?/g, ''))
+      .replace(/`([^`]+)`/g, '$1');
+    lines.push('AI Recommendations:', '', plainContent);
+    const body = lines.join('\n');
+    window.open(`mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`);
   };
 
   const handleGetRecommendations = async () => {
@@ -2648,11 +2648,11 @@ export const Home = forwardRef<HomeHandle, HomeProps>(({ onOpenSettings }, ref) 
                   {notebookGenerating ? '⏳ Generating...' : '📓 Generate Notebook'}
                 </button>
                 <button
-                  onClick={handleExportRecommendationsMd}
-                  title="Export recommendations as a formatted Markdown file"
+                  onClick={handleEmailRecommendations}
+                  title="Open in email client with pre-filled subject and body"
                   style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #1976d2', background: 'rgba(25,118,210,0.08)', color: '#1976d2', fontSize: 12, fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
                 >
-                  📄 Export MD
+                  📧 Email
                 </button>
               </div>
             )}
