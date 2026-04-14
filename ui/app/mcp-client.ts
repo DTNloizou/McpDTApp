@@ -2,7 +2,7 @@ import { functions } from '@dynatrace-sdk/app-utils';
 import { queryExecutionClient } from '@dynatrace-sdk/client-query';
 import { documentsClient } from '@dynatrace-sdk/client-document';
 import { loadConfig, getModelMaxInput } from './config';
-import { getDocumentFileRefs, buildKBContext, buildKBSummary, retrieveRelevantKB, isKBIndexed } from './knowledge-base';
+import { getDocumentFileRefs, buildKBContext, buildKBSummary, retrieveRelevantKB, isKBIndexed, getKBDocuments } from './knowledge-base';
 
 export interface ToolCall {
   tool: string;
@@ -321,8 +321,8 @@ export async function executeDql(
     if (result.state === 'FAILED') {
       const errorDetail = result.result?.records?.[0] 
         ? JSON.stringify(result.result.records[0]).slice(0, 500)
-        : (result as Record<string, unknown>).error 
-          ? JSON.stringify((result as Record<string, unknown>).error).slice(0, 500)
+        : (result as unknown as Record<string, unknown>).error 
+          ? JSON.stringify((result as unknown as Record<string, unknown>).error).slice(0, 500)
           : 'DQL query failed';
       return { status: 'error', message: errorDetail };
     }
@@ -578,9 +578,7 @@ export async function agenticChat(
         maxTokens: Math.min(2048, 4096),
         tools: AGENT_TOOLS,
       };
-      // Log approximate token usage for debugging
-      const approxTokens = Math.ceil(JSON.stringify(payload.messages).length / 4);
-      console.log(`[agenticChat] iteration=${i}, messages=${messages.length}, ~${approxTokens} tokens`);
+
       res = await functions.call('github-chat', {
         data: payload,
       });
@@ -796,6 +794,17 @@ export async function getClaudeRecommendations(
   // For GitHub Models (8K input token limit), cap results more aggressively
   // When using persona (agentic mode with tools), leave room for tool definitions
   const isAgentic = !!personaPrompt;
+
+  // Always inject DQL reference docs into persona calls for better query accuracy
+  let dqlRefContext = '';
+  if (isAgentic) {
+    const dqlDocs = getKBDocuments().filter(d =>
+      d.name === 'DQL_Queries_Reference.md' || d.name === 'dql-lessons.md'
+    );
+    if (dqlDocs.length > 0) {
+      dqlRefContext = dqlDocs.map(d => `--- ${d.name} ---\n${d.content}`).join('\n\n');
+    }
+  }
   const maxResults = config.llmProvider === 'github-models'
     ? (isAgentic ? 1500 : 3000)
     : 8000;
@@ -890,6 +899,11 @@ export async function getClaudeRecommendations(
       `3. CORRELATE VIA DATA — to cross-reference (e.g. bizevents→spans), use shared fields like trace_id or dt.entity.service from your discovery results. Do NOT guess that a bizevent field name will appear as a span.name.`,
       `4. EXECUTE AND VERIFY — run each query. If it returns 0 records, the filter is wrong. Re-discover and retry with corrected values.`,
       `5. Only include queries with verified non-empty results in your final analysis. Drop or fix any that return nothing.`,
+      ...(dqlRefContext ? [
+        ``,
+        `DQL REFERENCE (verified queries — use these as exact templates):`,
+        dqlRefContext,
+      ] : []),
     ] : [
       `CRITICAL: Do NOT invent field names. Only use fields listed below for each data source.`,
       ``,
@@ -935,9 +949,9 @@ export async function getClaudeRecommendations(
         if (agenticResult.status === 'success') {
           return agenticResult;
         }
-        console.warn('[getClaudeRecommendations] Agentic mode returned error, falling back to non-agentic:', agenticResult.message);
+        // Agentic mode returned error — fall back to non-agentic
       } catch (e) {
-        console.warn('[getClaudeRecommendations] Agentic mode threw, falling back to non-agentic:', e);
+        // Agentic mode threw — fall back to non-agentic
       }
     }
 
@@ -1024,7 +1038,7 @@ export async function createNotebook(
     } else if (typeof err === 'object' && err !== null) {
       msg = JSON.stringify(err).slice(0, 300);
     }
-    console.error('Notebook creation error:', err);
+
     return { status: 'error', message: msg };
   }
 }
